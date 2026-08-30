@@ -1026,11 +1026,22 @@ const call = {
   joined: false,
   muted: false,
   opening: false, // unmuted, but the microphone is not live yet — never shown as hot
-  presence: new Map(), // pubkey -> { lastSeen, muted }
-  peers: new Map(), // pubkey -> { pc, sender, audioEl, candidateQueue, remoteSet }
-  speaking: new Set(), // pubkeys (including our own) currently over threshold
+  session: null, // this stint at the hearth; regenerated on every join (see joinCall)
+  presence: new Map(), // peer key -> { pubkey, session, lastSeen, muted }
+  peers: new Map(), // peer key -> { pubkey, session, pc, sender, audioEl, candidateQueue, remoteSet }
+  speaking: new Set(), // peer keys (plus our own bare pubkey) currently over threshold
   localStream: null,
 };
+
+// The mesh is keyed by (pubkey, session), not pubkey alone. A pubkey is a
+// person; a session is one page in one browser sitting at the fire. Keying
+// by the pair is what lets a rejoin whose "leave" beat was lost read as a
+// new arrival instead of colliding with the stale connection, and what
+// keeps one identity open in two windows from answering each other's
+// offers as if they were the same endpoint.
+function peerKeyOf(pubkey, session) {
+  return pubkey + "/" + session;
+}
 let heartbeatTimer = null;
 let callWarnTimer = null;
 
@@ -1053,43 +1064,51 @@ async function sendEphemeral(partial, label) {
   }
 }
 
-function sendSignal(pubkey, payload) {
+// The p tag can only address a pubkey, and every session of that pubkey
+// receives it, so the payload itself says which session it is from and
+// which it is for.
+function sendSignal(pubkey, toSession, payload) {
+  const content = JSON.stringify({ ...payload, session: call.session, to: toSession });
   sendEphemeral(
-    { kind: KINDS.CALL_SIGNAL, tags: [["h", GROUP_ID], ["p", pubkey]], content: JSON.stringify(payload) },
+    { kind: KINDS.CALL_SIGNAL, tags: [["h", GROUP_ID], ["p", pubkey]], content },
     "call signal to " + displayName(pubkey)
   );
 }
 
 function publishPresence() {
   sendEphemeral(
-    { kind: KINDS.CALL_PRESENCE, tags: [["h", GROUP_ID]], content: JSON.stringify({ status: "here", muted: call.muted }) },
+    { kind: KINDS.CALL_PRESENCE, tags: [["h", GROUP_ID]], content: JSON.stringify({ status: "here", session: call.session, muted: call.muted }) },
     "presence beat"
   );
 }
 
 function publishLeavePresence() {
   sendEphemeral(
-    { kind: KINDS.CALL_PRESENCE, tags: [["h", GROUP_ID]], content: JSON.stringify({ status: "leave" }) },
+    { kind: KINDS.CALL_PRESENCE, tags: [["h", GROUP_ID]], content: JSON.stringify({ status: "leave", session: call.session }) },
     "presence beat"
   );
 }
 
 /* ---------- presence: who's at the hearth right now ---------- */
 function handlePresence(event) {
-  if (event.pubkey === identity.pubkey) return; // our own heartbeat, echoed back
   let payload;
   try {
     payload = JSON.parse(event.content);
   } catch (e) {
     return;
   }
+  // A beat from a build that predates session ids gets the empty session,
+  // so an old copy of the app still takes exactly one seat per pubkey.
+  const session = typeof payload.session === "string" ? payload.session : "";
+  if (event.pubkey === identity.pubkey && session === call.session) return; // our own heartbeat, echoed back
+  const key = peerKeyOf(event.pubkey, session);
   if (payload.status === "leave") {
-    call.presence.delete(event.pubkey);
-    teardownPeer(event.pubkey);
+    call.presence.delete(key);
+    teardownPeer(key);
   } else {
-    const isNew = !call.presence.has(event.pubkey);
-    call.presence.set(event.pubkey, { lastSeen: Date.now(), muted: !!payload.muted });
-    if (isNew && call.joined) maybeConnectToPeer(event.pubkey);
+    const isNew = !call.presence.has(key);
+    call.presence.set(key, { pubkey: event.pubkey, session, lastSeen: Date.now(), muted: !!payload.muted });
+    if (isNew && call.joined) maybeConnectToPeer(event.pubkey, session);
   }
   renderHearth();
 }
@@ -1101,10 +1120,10 @@ function handlePresence(event) {
 setInterval(() => {
   const now = Date.now();
   let changed = false;
-  for (const [pubkey, info] of call.presence) {
+  for (const [key, info] of call.presence) {
     if (now - info.lastSeen > PRESENCE_TIMEOUT_MS) {
-      call.presence.delete(pubkey);
-      teardownPeer(pubkey);
+      call.presence.delete(key);
+      teardownPeer(key);
       changed = true;
     }
   }
@@ -1112,18 +1131,21 @@ setInterval(() => {
 }, 3000);
 
 /* ---------- mesh: one RTCPeerConnection per other participant ---------- */
-function maybeConnectToPeer(pubkey) {
-  if (call.peers.has(pubkey)) return;
+function maybeConnectToPeer(pubkey, session) {
+  if (call.peers.has(peerKeyOf(pubkey, session))) return;
   // Both sides run this independently and need to agree on exactly one
   // offerer without talking it over first — a plain string compare on the
-  // pubkeys they already both know does that.
-  if (identity.pubkey > pubkey) createPeer(pubkey, true);
+  // peer keys they already both know from presence does that. Comparing
+  // keys rather than pubkeys is what breaks the tie between two sessions
+  // of the same identity.
+  if (peerKeyOf(identity.pubkey, call.session) > peerKeyOf(pubkey, session)) createPeer(pubkey, session, true);
 }
 
-function createPeer(pubkey, isInitiator) {
+function createPeer(pubkey, session, isInitiator) {
+  const key = peerKeyOf(pubkey, session);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  const entry = { pc, sender: null, audioEl: null, candidateQueue: [], remoteSet: false };
-  call.peers.set(pubkey, entry);
+  const entry = { pubkey, session, pc, sender: null, audioEl: null, candidateQueue: [], remoteSet: false };
+  call.peers.set(key, entry);
 
   // Every connection gets an audio sender from birth, track or no
   // track: a peer who joins while we are muted must still have
@@ -1148,21 +1170,28 @@ function createPeer(pubkey, isInitiator) {
     document.body.appendChild(audioEl);
     audioEl.play().catch(() => {});
     entry.audioEl = audioEl;
-    attachSpeakingDetector(pubkey, stream);
+    attachSpeakingDetector(key, stream);
   });
 
   pc.addEventListener("icecandidate", (e) => {
-    if (e.candidate) sendSignal(pubkey, { type: "candidate", candidate: e.candidate.toJSON() });
+    if (e.candidate) sendSignal(pubkey, session, { type: "candidate", candidate: e.candidate.toJSON() });
   });
 
   pc.addEventListener("connectionstatechange", () => {
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") teardownPeer(pubkey);
+    if (pc.connectionState !== "failed" && pc.connectionState !== "closed") return;
+    if (call.peers.get(key) !== entry) return; // already replaced by a fresh connection
+    teardownPeer(key);
+    // A failed connection is not a leave. While their presence is still
+    // fresh they are still at the fire, so try again — without this, a
+    // one-off ICE failure would part the pair for as long as both stayed
+    // seated, because nothing else re-offers to a peer already seen.
+    if (call.joined && call.presence.has(key)) maybeConnectToPeer(pubkey, session);
   });
 
   if (isInitiator) {
     pc.createOffer()
       .then((offer) => pc.setLocalDescription(offer).then(() => offer))
-      .then((offer) => sendSignal(pubkey, { type: "offer", sdp: offer.sdp }));
+      .then((offer) => sendSignal(pubkey, session, { type: "offer", sdp: offer.sdp }));
   }
 
   return entry;
@@ -1179,27 +1208,38 @@ async function flushQueuedCandidates(entry) {
 }
 
 async function handleSignal(event) {
-  if (event.pubkey === identity.pubkey) return;
   let payload;
   try {
     payload = JSON.parse(event.content);
   } catch (e) {
     return;
   }
+  const session = typeof payload.session === "string" ? payload.session : "";
+  if (event.pubkey === identity.pubkey && session === call.session) return; // our own signal, echoed back
+  // Addressed to another session of our pubkey — its offer is not ours to
+  // answer. A signal from a build without session ids carries no "to" and
+  // is accepted, matching its empty-session seat in presence.
+  if (typeof payload.to === "string" && payload.to !== call.session) return;
+  const key = peerKeyOf(event.pubkey, session);
 
   if (payload.type === "offer") {
     if (!call.joined) return; // not at the hearth — nothing to answer with
-    const entry = call.peers.get(event.pubkey) || createPeer(event.pubkey, false);
+    // An offer for a session we already hold a connection to means that
+    // side has started over — whatever we still hold is dead to them, so
+    // drop it and answer the new one rather than confusing the old
+    // connection with a description it never negotiated toward.
+    if (call.peers.has(key)) teardownPeer(key);
+    const entry = createPeer(event.pubkey, session, false);
     await entry.pc.setRemoteDescription({ type: "offer", sdp: payload.sdp });
     entry.remoteSet = true;
     await flushQueuedCandidates(entry);
     const answer = await entry.pc.createAnswer();
     await entry.pc.setLocalDescription(answer);
-    sendSignal(event.pubkey, { type: "answer", sdp: answer.sdp });
+    sendSignal(event.pubkey, session, { type: "answer", sdp: answer.sdp });
     return;
   }
 
-  const entry = call.peers.get(event.pubkey);
+  const entry = call.peers.get(key);
   if (!entry) return; // an answer or candidate with no offer on our side — drop it
 
   if (payload.type === "answer") {
@@ -1219,24 +1259,27 @@ async function handleSignal(event) {
   }
 }
 
-function teardownPeer(pubkey) {
-  const entry = call.peers.get(pubkey);
+function teardownPeer(key) {
+  const entry = call.peers.get(key);
   if (!entry) return;
   entry.pc.close();
   if (entry.audioEl) entry.audioEl.remove();
-  detachSpeakingDetector(pubkey);
-  call.peers.delete(pubkey);
-  call.speaking.delete(pubkey);
+  detachSpeakingDetector(key);
+  call.peers.delete(key);
+  call.speaking.delete(key);
   renderHearth();
 }
 
 /* ---------- speaking: a volume gate per stream, ours included ---------- */
 const SPEAKING_RMS = 0.025;
 const SPEAKING_HOLD_MS = 500;
-const analysers = new Map(); // pubkey -> { ctx, interval }
+// Keyed like call.speaking: remote streams by peer key, our own microphone
+// by our bare pubkey — a peer key always contains a slash, so the two can
+// share the map without colliding.
+const analysers = new Map(); // key -> { ctx, interval }
 
-function attachSpeakingDetector(pubkey, stream) {
-  detachSpeakingDetector(pubkey);
+function attachSpeakingDetector(key, stream) {
+  detachSpeakingDetector(key);
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const ctx = new AudioCtx();
   const source = ctx.createMediaStreamSource(stream);
@@ -1254,21 +1297,21 @@ function attachSpeakingDetector(pubkey, stream) {
     }
     if (Math.sqrt(sumSquares / data.length) > SPEAKING_RMS) lastLoudAt = Date.now();
     const speaking = Date.now() - lastLoudAt < SPEAKING_HOLD_MS;
-    if (speaking !== call.speaking.has(pubkey)) {
-      if (speaking) call.speaking.add(pubkey);
-      else call.speaking.delete(pubkey);
+    if (speaking !== call.speaking.has(key)) {
+      if (speaking) call.speaking.add(key);
+      else call.speaking.delete(key);
       renderHearth();
     }
   }, 200);
-  analysers.set(pubkey, { ctx, interval });
+  analysers.set(key, { ctx, interval });
 }
 
-function detachSpeakingDetector(pubkey) {
-  const a = analysers.get(pubkey);
+function detachSpeakingDetector(key) {
+  const a = analysers.get(key);
   if (!a) return;
   clearInterval(a.interval);
   a.ctx.close();
-  analysers.delete(pubkey);
+  analysers.delete(key);
 }
 
 /* ---------- the mic: press to join, press again to mute ---------- */
@@ -1282,10 +1325,15 @@ async function joinCall() {
   call.joined = true;
   call.muted = false;
   call.opening = false;
+  // A fresh session id on every join, not once per page load: if our last
+  // "leave" beat was lost (it is ephemeral, sent once), the others still
+  // hold our old seat and its dead connection, and only a key they have
+  // never seen makes this arrival look new to them.
+  call.session = S.utils.bytesToHex(S.utils.randomBytes(8));
   attachSpeakingDetector(identity.pubkey, call.localStream);
   publishPresence();
   heartbeatTimer = setInterval(publishPresence, HEARTBEAT_MS);
-  for (const pubkey of call.presence.keys()) maybeConnectToPeer(pubkey);
+  for (const info of call.presence.values()) maybeConnectToPeer(info.pubkey, info.session);
   renderHearth();
 }
 
@@ -1361,7 +1409,7 @@ function leaveCall() {
   publishLeavePresence();
   clearInterval(heartbeatTimer);
   heartbeatTimer = null;
-  for (const pubkey of [...call.peers.keys()]) teardownPeer(pubkey);
+  for (const key of [...call.peers.keys()]) teardownPeer(key);
   detachSpeakingDetector(identity.pubkey);
   if (call.localStream) {
     for (const track of call.localStream.getTracks()) track.stop();
@@ -1381,6 +1429,33 @@ micBtn.addEventListener("click", () => {
 leaveBtn.addEventListener("click", leaveCall);
 
 /* ---------- rendering: the voice screen and the hearth in the scroll ---------- */
+
+// The mesh knows sessions; the hearth shows people. A person on two
+// devices is one seat, talking if any of their streams is over threshold,
+// and muted only when every one of their sessions is.
+function speakingAt(pubkey) {
+  if (call.speaking.has(pubkey)) return true; // our own detector, keyed by bare pubkey
+  for (const info of call.presence.values()) {
+    if (info.pubkey === pubkey && call.speaking.has(peerKeyOf(info.pubkey, info.session))) return true;
+  }
+  return false;
+}
+
+function mutedAt(pubkey) {
+  let seated = false;
+  let allMuted = true;
+  if (pubkey === identity.pubkey && call.joined) {
+    seated = true;
+    allMuted = call.muted;
+  }
+  for (const info of call.presence.values()) {
+    if (info.pubkey !== pubkey) continue;
+    seated = true;
+    if (!info.muted) allMuted = false;
+  }
+  return seated && allMuted;
+}
+
 function buildRing(container, pubkeys) {
   container.innerHTML = "";
   if (pubkeys.length === 0) {
@@ -1389,9 +1464,9 @@ function buildRing(container, pubkeys) {
   }
   for (const pubkey of pubkeys) {
     const isMe = pubkey === identity.pubkey;
-    const muted = isMe ? call.muted : (call.presence.get(pubkey) || {}).muted;
+    const muted = mutedAt(pubkey);
     const b = document.createElement("button");
-    b.className = "hAv" + (call.speaking.has(pubkey) ? " speaking" : "");
+    b.className = "hAv" + (speakingAt(pubkey) ? " speaking" : "");
     const av = document.createElement("div");
     av.className = "av";
     av.style.background = colorFor(pubkey);
@@ -1416,8 +1491,11 @@ function buildRing(container, pubkeys) {
 
 // One hearth, rendered once, whatever its current size.
 function renderHearth() {
-  const seatedPubkeys = [...call.presence.keys()];
-  if (call.joined) seatedPubkeys.unshift(identity.pubkey);
+  const seatedPubkeys = [];
+  if (call.joined) seatedPubkeys.push(identity.pubkey);
+  for (const info of call.presence.values()) {
+    if (!seatedPubkeys.includes(info.pubkey)) seatedPubkeys.push(info.pubkey);
+  }
   const seated = seatedPubkeys.length;
 
   hearthEl.classList.toggle("cold", seated === 0);
@@ -1428,7 +1506,7 @@ function renderHearth() {
   buildRing(hRingEl, seatedPubkeys);
   measureCompact(); // who is seated changes the hearth's natural height
 
-  const speaker = seatedPubkeys.find((p) => call.speaking.has(p));
+  const speaker = seatedPubkeys.find((p) => speakingAt(p));
   let captionText, quiet;
   if (speaker) {
     captionText = speaker === identity.pubkey ? "you’re talking" : displayName(speaker) + " is talking";
