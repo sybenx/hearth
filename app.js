@@ -89,7 +89,6 @@ const xCodeFailEl = document.getElementById("xCodeFail");
 const xAckEl = document.getElementById("xAck");
 const xAckBox = document.getElementById("xAckBox");
 const xAckTextEl = document.getElementById("xAckText");
-const xListEl = document.getElementById("xList");
 const xMultiEl = document.getElementById("xMulti");
 const xButtonsEl = document.getElementById("xButtons");
 const xSpinEl = document.getElementById("xSpin");
@@ -5069,21 +5068,6 @@ function xRender(opts) {
   if (opts.sas) xDigitsEl.textContent = opts.sas.digits;
   setCodeEntry(opts.code || null);
   setAcknowledgement(opts.ack || null);
-  xShow(xListEl, !!opts.list);
-  xListEl.innerHTML = "";
-  for (const entry of opts.list || []) {
-    // A button only where there is something to choose. Several
-    // codes shown for somebody to type on the other device are a
-    // list to read, and rendering them as controls invites a tap
-    // that does nothing.
-    const row = document.createElement(opts.onPick ? "button" : "div");
-    const dg = document.createElement("div");
-    dg.className = "xDigits";
-    dg.textContent = entry.sas.digits;
-    row.append(dg);
-    if (opts.onPick) row.addEventListener("click", () => opts.onPick(entry));
-    xListEl.appendChild(row);
-  }
   xButtonsEl.innerHTML = "";
   for (const b of opts.buttons || []) {
     const btn = document.createElement("button");
@@ -5466,27 +5450,10 @@ async function onTransferEvent(type, data) {
   if (type === "sas") {
     // A second device answering while a key is already in hand must
     // not redraw the screen underneath somebody who is being asked
-    // whose identity they are about to adopt. The new code is in the
-    // list either way; it does not have to interrupt to get there.
+    // whose identity they are about to adopt. The new code is held
+    // either way; it does not have to interrupt to get there.
     if (xfer.held().length > 0) return;
-    if (data.list.length === 1) {
-      xRender({
-        title: "your new device",
-        prompt: "Type this on your other device",
-        sas: data.list[0].sas,
-        note: "It's asking for five figures. These are them.",
-        waiting: "waiting for your other device",
-      });
-    } else {
-      xRender({
-        title: "your new device",
-        prompt: "Type one of these on your other device",
-        note: "More than one device answered this code. Only the one that's really yours " +
-          "will be accepted, so you don't have to know which is which.",
-        list: data.list,
-        waiting: "waiting for your other device",
-      });
-    }
+    renderShowingCode(data);
     return;
   }
 
@@ -5495,14 +5462,7 @@ async function onTransferEvent(type, data) {
   // were both told the right number, which takes somebody typing
   // two codes deliberately, and then the person says which.
   if (type === "arrived") {
-    const held = xfer.held();
-    if (held.length <= 1) { offerLogin(data.peer); return; }
-    xRender({
-      title: "your new device",
-      prompt: "Tap the code the device you're adding from is showing",
-      list: held,
-      onPick: (entry) => offerLogin(entry.peer),
-    });
+    offerLogin(data.peer);
     return;
   }
 
@@ -5590,6 +5550,39 @@ async function onTransferEvent(type, data) {
   }
 }
 
+/* ---------- the code this device is showing (qrst §9.2, §13) ----------
+
+   One code at a time, and the first device that answered first. If
+   somebody else pointed a camera at this screen there are two or
+   three codes rather than one, and they are not put up together: the
+   specification is explicit that it is never all of them at once,
+   because a list of numbers to try is a list somebody works through
+   until one is accepted.
+
+   What advances it is a tap here, because nothing else can. The far
+   device knows a code did not match and has no way to say so — the
+   number is never transmitted, in either direction, and a message
+   saying "wrong one" would be a message an attacker could send. So
+   the person who just watched their other device refuse a number is
+   the one who asks this screen for the next. */
+function renderShowingCode(view) {
+  if (!view) return;
+  const more = view.total > 1;
+  xRender({
+    title: "your new device",
+    prompt: "Type this on your other device",
+    sas: view.sas,
+    note: more
+      ? "More than one device answered this code, so this is the first of " + view.total +
+        ". If your other device won't take it, it isn't the one this belongs to."
+      : "It's asking for five figures. These are them.",
+    alts: more
+      ? [{ label: "my device won't take this one", onClick: () => renderShowingCode(xfer.nextCode()) }]
+      : [],
+    waiting: "waiting for your other device",
+  });
+}
+
 /* ---------- the release screen (qrst §9) ----------
 
    Two things are asked here and they guard different things. The
@@ -5654,6 +5647,11 @@ function renderConsent(data) {
     ? ""
     : " This request didn't come from this device's camera, so nothing about it says the " +
       "other device is in the room with you.";
+  // §13: which of the devices that answered this is. Said only when
+  // there is more than one, because "1 of 1" is noise.
+  const which = data.total > 1
+    ? " This is device " + data.position + " of the " + data.total + " that answered."
+    : "";
 
   const send = () => sendKey(data);
   const decline = { label: "don't send", onClick: () => xfer && xfer.deny(data.peer) };
@@ -5663,7 +5661,7 @@ function renderConsent(data) {
     prompt: "You are about to give " + claim + " your key.",
     note: "This is the identity itself, not a permission you can take back later. Whoever " +
       "holds it is you, on Nostr, permanently — there is no way to change the key afterwards. " +
-      "The list of relays this device uses goes with it." + unscanned,
+      "The list of relays this device uses goes with it." + unscanned + which,
     code: {
       label: "Type the five figures shown on your other device",
       onSubmit: (typed) => {
@@ -5698,11 +5696,19 @@ function renderConsent(data) {
           return;
         }
         if (result.reason === "mismatch") {
+          // §9.2: where more than one device answered, no match moves
+          // the question to the next one and the prompt for it is
+          // already on screen by the time this runs. Saying so is
+          // the difference between "you mistyped" and "that was a
+          // different device asking".
           xCodeInput.value = "";
           paintCodeCells();
-          xCodeFailEl.textContent = result.left === 1
-            ? "That isn't the code your other device is showing. One more try."
-            : "That isn't the code your other device is showing. " + result.left + " tries left.";
+          const left = result.left === 1
+            ? "One more try." : result.left + " tries left.";
+          xCodeFailEl.textContent = result.advanced
+            ? "That wasn't the code that device is showing. Here's the next device that " +
+              "answered. " + left
+            : "That isn't the code your other device is showing. " + left;
           xShow(xCodeFailEl, true);
         }
         // "spent" ends the session, and the session says so itself.

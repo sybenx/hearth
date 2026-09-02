@@ -96,8 +96,13 @@ const VERSION_BYTE = 1;
 const SESSION_SECONDS = 600;      // §2, a session lives ten minutes
 const WRAP_EXPIRY_SECONDS = 600;  // §11.4
 const ZEROIZE_AFTER_MS = 60000;   // §7 step 18, §8 step 18
-const MAX_PENDING = 5;            // §8, pending requests per session
-const SAS_LIST_MAX = 3;           // §9, codes shown at once
+/* §13: at most three candidates held in a session. §8 also caps the
+   requests a flow-B sender queues at five, and in that flow the two
+   are the same set — every queued request runs its own nonce
+   exchange and so becomes a candidate with a code. The tighter of
+   the two is the one that satisfies both, so three is what this
+   holds, in either flow. Raised with the specification's author. */
+const HELD_MAX = 3;
 const MAX_ATTEMPTS = 5;           // §9, code entries per session
 // §9: a burner this device has already failed a code against is
 // refused a second session, and three failed sessions in an hour are
@@ -973,6 +978,10 @@ function startSession(opts) {
   // through the two or three codes a second scanner put on the far
   // screen as well as their own mistypes.
   let attemptsLeft = MAX_ATTEMPTS;
+  // §9.2: which candidate's code is on screen, and which candidate is
+  // being asked about. One at a time in both cases, first responder
+  // first, and it is never all of them at once.
+  let displayAt = 0;
   let scanned = opts.scanned || null;       // what the QR said, when we scanned one
   const relays = (scanned ? scanned.relays : (opts.relays || DEFAULT_RELAYS)).slice(0, 4);
 
@@ -1089,10 +1098,12 @@ function startSession(opts) {
       // A retransmission from a burner already answered is the
       // same responder, not a second one (§13).
       if (existing && existing.commit) return;
-      // §8: at most five pending requests in a session, so a
-      // flooder costs the person a handful of taps rather than an
-      // unbounded queue.
-      if (peers.size >= MAX_PENDING) { noteResponder(); return; }
+      // §13: three held, so a flooder costs the person a couple of
+      // taps rather than an unbounded queue. A later responder is
+      // dropped, never a reason to abort — seeing a code is not
+      // evidence of an attack, and a session that aborted on one
+      // could be denied by anybody who photographed the code.
+      if (peers.size >= HELD_MAX) { noteResponder(); return; }
       const commit = tagValue(rumor.tags, "commit");
       if (!commit) return;
       const peer = peerFor(from);
@@ -1212,16 +1223,44 @@ function startSession(opts) {
     if (role === "holder") {
       askConsent(peer);
     } else {
-      emit("sas", { list: sasList() });
+      // §9.2: one candidate's code, the active one. A second device
+      // answering does not take the screen from the first.
+      emit("sas", activeView());
       maybeArrived(peer);
     }
   }
 
-  // §8: one at a time. A second device asking while the person is
+  // §13: one at a time. A second device asking while the person is
   // reading the first prompt waits its turn rather than replacing
   // what is on screen under their thumb.
   function askConsent(peer) {
     if (awaitingConsent && peers.has(awaitingConsent)) return;
+    const at = candidates().findIndex((p) => p.burner === peer.burner);
+    displayAt = at < 0 ? 0 : at;
+    showConsent(peer);
+  }
+
+  /* §9.2: the value the person obtained matched nothing this device
+     is holding for the candidate it is asking about, so the question
+     moves to the next one. This is not a second guess at the same
+     code — each candidate's code was fixed when its nonces were
+     revealed and nobody in the middle can influence it — which is
+     why the specification says the budget disambiguates candidates
+     rather than granting attempts. */
+  function advanceConsent() {
+    const list = candidates();
+    if (list.length <= 1) return false;
+    for (let step = 1; step <= list.length; step++) {
+      const at = (displayAt + step) % list.length;
+      if (list[at].sent) continue;
+      displayAt = at;
+      showConsent(list[at]);
+      return true;
+    }
+    return false;
+  }
+
+  function showConsent(peer) {
     awaitingConsent = peer.burner;
     emit("consent", {
       peer: peer.burner,
@@ -1235,6 +1274,8 @@ function startSession(opts) {
       // Whether this session's pairing was read by this device's own
       // camera is something only the caller knows: a fragment on a
       // page load looks the same whichever app put it there.
+      position: (displayAt % Math.max(1, candidates().length)) + 1,
+      total: candidates().length,
     });
   }
 
@@ -1243,18 +1284,54 @@ function startSession(opts) {
   // over as many as four relays. The screen is told only once both
   // are in hand.
   function maybeArrived(peer) {
-    if (!peer.held || !peer.sas || peer.announced) return;
+    if (!peer || !peer.held || !peer.sas || peer.announced) return;
+    // §9.4: the candidate to commit is the one whose code the sender
+    // confirmed, and that is the one whose code was on this screen
+    // when they read it. A key from any other candidate is held out
+    // of sight until the display reaches it, so nothing arrives
+    // under somebody who is looking at a different number.
+    const showing = active();
+    if (!showing || showing.burner !== peer.burner) return;
     peer.announced = true;
     emit("arrived", { peer: peer.burner, sas: peer.sas });
   }
 
-  // §9: the three most recent, newest first, so a person
-  // whose code was scanned by somebody else still has a short list
-  // to find their own device in rather than a long one.
-  function sasList() {
+  /* §13: the candidates, first responder first. Arrival order and
+     not the reverse of it, because the specification names the first
+     responder as the active one and a list starting at the newest
+     puts the device that answered a code somebody else pointed a
+     camera at in front of the one that answered honestly. A Map
+     keeps its insertion order, so this is the order they arrived in.
+
+     A denied candidate is out of the list. A spent one is not: it is
+     still a device that answered, and dropping it would renumber the
+     positions the person is being shown. */
+  function candidates() {
     const out = [];
-    for (const peer of peers.values()) if (peer.sas) out.push({ peer: peer.burner, sas: peer.sas });
-    return out.reverse().slice(0, SAS_LIST_MAX);
+    for (const peer of peers.values()) if (peer.sas && !peer.denied) out.push(peer);
+    return out.slice(0, HELD_MAX);
+  }
+
+  // The one whose code is on screen, or which is being asked about.
+  // The cursor wraps, because with three at the outside a person who
+  // has gone past their own device should not be stuck past it.
+  function active() {
+    const list = candidates();
+    if (list.length === 0) return null;
+    return list[displayAt % list.length];
+  }
+
+  function activeView() {
+    const peer = active();
+    if (!peer) return null;
+    const list = candidates();
+    return {
+      peer: peer.burner,
+      sas: peer.sas,
+      position: (displayAt % list.length) + 1,
+      total: list.length,
+      held: !!peer.held,
+    };
   }
 
   function stop(reason, detail) {
@@ -1302,7 +1379,12 @@ function startSession(opts) {
         return { ok: true };
       }
       attemptsLeft--;
-      if (attemptsLeft > 0) return { ok: false, reason: "mismatch", left: attemptsLeft };
+      if (attemptsLeft > 0) {
+        // §9.2: no match here means the next held candidate, where
+        // there is one. The prompt for it goes up as this returns.
+        const advanced = advanceConsent();
+        return { ok: false, reason: "mismatch", left: attemptsLeft, advanced };
+      }
       // Spent. §9: the session is dead, the burner goes, and this
       // peer is refused a second session for an hour, because the
       // far side is still showing the same QR and has no way to
@@ -1361,7 +1443,9 @@ function startSession(opts) {
       // happened, rather than waiting out ten minutes for somebody
       // who has already said no.
       abortTo(peerHex);
-      const next = nextPending();
+      awaitingConsent = null;
+      displayAt = 0;
+      const next = candidates().find((p) => !p.sent);
       if (next) askConsent(next);
       else emit("waiting");
     },
@@ -1380,6 +1464,21 @@ function startSession(opts) {
       const peer = peers.get(peerHex);
       if (!peer || !peer.held || finished) return null;
       const held = peer.held;
+      // §13: the profile's check again, at acceptance. It was made
+      // when the key arrived and nothing has touched it since, so
+      // this should never fire — but the section says a candidate
+      // failing it here is discarded and the display moves on, and a
+      // rule that only holds because of where an earlier check
+      // happens to sit is one line away from not holding.
+      if (!validPrivkeyHex(held.hex)) {
+        peer.held = null;
+        peer.announced = false;
+        peers.delete(peerHex);
+        const next = candidates().find((p) => p.held);
+        if (next) { displayAt = candidates().indexOf(next); maybeArrived(next); }
+        else stop("declined");
+        return null;
+      }
       const record = {
         privkeyHex: held.hex,
         lock: held.lock,
@@ -1405,17 +1504,39 @@ function startSession(opts) {
     },
 
     cancel() { stop("cancelled"); },
-    peers() { return sasList(); },
+    peers() {
+      return candidates().map((peer) => ({ peer: peer.burner, sas: peer.sas }));
+    },
 
-    // The wraps in hand, newest first. One is the ordinary case;
-    // more than one means two devices both got a code typed at
-    // them, which takes somebody entering two codes on purpose.
+    // §9.2, the receiving side: the code on screen now, and how far
+    // through the held candidates it is.
+    showing() { return activeView(); },
+
+    // §9.2: the value the sender obtained matched none of what this
+    // device is showing, so the display moves to the next candidate.
+    // Driven from here rather than from a message, because the far
+    // side has no way to tell this one that a code did not match.
+    nextCode() {
+      const list = candidates();
+      if (list.length === 0) return null;
+      displayAt = (displayAt + 1) % list.length;
+      const view = activeView();
+      // A candidate whose key is already in hand: the person has
+      // arrived at the device that really did send one.
+      if (view && view.held) maybeArrived(active());
+      return view;
+    },
+
+    // The keys in hand, first responder first. One is the ordinary
+    // case; more than one means two devices both got a code typed at
+    // them, which takes somebody entering two codes on purpose. Only
+    // the one whose code is on screen is ever offered (§9.4).
     held() {
       const out = [];
       for (const peer of peers.values()) {
         if (peer.held && peer.sas) out.push({ peer: peer.burner, sas: peer.sas });
       }
-      return out.reverse();
+      return out;
     },
 
     // How each relay is getting on, for a screen that wants to say
@@ -1423,11 +1544,6 @@ function startSession(opts) {
     // not start.
     transport() { return pool ? pool.summary() : null; },
   };
-
-  function nextPending() {
-    for (const peer of peers.values()) if (peer.sas && !peer.denied && !peer.sent) return peer;
-    return null;
-  }
 
   // Getting started: a burner, a subscription, and either a QR to
   // draw or a first message to send.
