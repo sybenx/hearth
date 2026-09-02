@@ -4513,88 +4513,35 @@ function renderTransfers() {
 
 /* ---------- the code, drawn and read ---------- */
 
-/* ---------- what the code points at (qrst §11.2a) ----------
+/* ---------- what the code points at (qrst §11.2) ----------
 
-   Not the qrst URI on its own. A phone's own camera app,
-   which is what somebody actually points at a screen, hands an
-   unknown scheme to a web search rather than to an app, and no
-   browser has registered that scheme because Hearth is a page rather
-   than an installed app. So the code carries an ordinary https link
-   to this copy of Hearth, with the pairing URI inside it, and the
-   phone opens what it always opens.
+   An ordinary https link with the pairing parameters in its
+   fragment, which is what the specification defines. There used to
+   be a qrst:// URI nested inside a link of Hearth's own; §11.2
+   retired the scheme and made its parameters the fragment itself, so
+   the nesting went with it and there is one string again.
 
-   In the fragment rather than the query, because a fragment is never
-   sent to the server: the host this page is served from never sees a
-   burner key or a relay list in a request log. That is what keeps
-   the link from introducing anybody: the origin is the copy of
-   Hearth that drew the code, and it learns nothing from being asked
-   for the page.
+   A phone's own camera app is what somebody actually points at a
+   screen, and it hands an unknown scheme to a web search and an
+   https link to a browser. The fragment is never sent to a server,
+   so the copy of Hearth the link names never sees a burner key or a
+   relay list in a request log — and where the scanning device is a
+   client of this specification it never asks for the page at all.
+   What happens when it does is §11.2a, which is Hearth's own
+   index.html answering.
 
-   Whole rather than unpacked into the link's own parameters. The
-   string the specification defines is the string its rules are
-   written about, so it arrives at the parser exactly as it left the
-   other device, and a version this build does not know is still
-   refused by the same line of code.
+   The fields the specification defines, so that a fragment carrying
+   them can be recognised and, once used, cleared out of the address
+   bar without taking anything else in it with it. */
+const PAIRING_FIELDS = ["v", "mode", "p", "npub", "relay", "origin"];
 
-   The clipboard gets the bare qrst:// URI instead, which is §12.1
-   and is the opposite trade on purpose. A code has to be held up to
-   a camera; a link can be sent in a message, which is how credential
-   theft is already delivered. An https link in a message invites a
-   tap and a qrst:// string invites reading, so the less tappable
-   form is the one that belongs behind a copy button. */
-const PAIR_PARAM = "pair";
-const PAIR_SCHEME = "qrst://";
-
-// The inverse of pairingLink, and the only thing in Hearth that
-// decides what a device code looks like. Both readers go through it:
-// the scanner pointing a camera at a screen, and the page that was
-// opened by following one. They disagreed once — the code became a
-// link and only the page-load half was taught to read it, so Hearth
-// refused the code Hearth had just drawn — and one function is what
-// stops that being possible rather than unlikely.
-//
-// Takes a link, a whole page URL, or a bare pairing URI, and returns
-// the pairing URI inside it. What that URI has to contain is not this
-// function's business: it hands the string to the parser the
-// specification is written about, unchanged.
-function innerPairingUri(text) {
-  const trimmed = (text || "").trim();
-  if (trimmed.startsWith(PAIR_SCHEME)) return trimmed;
-  let hash;
-  try {
-    hash = new URL(trimmed).hash;
-  } catch (err) {
-    throw new Error("that code isn't a Hearth device code");
-  }
-  const inner = pairFromFragment(hash.slice(1));
-  if (!inner) throw new Error("that code isn't a Hearth device code");
-  return inner;
-}
-
-// Everything after the marker, to the end. Not URLSearchParams,
-// because the URI is now carried unescaped and its own ampersands
-// would look like the end of it to a parser that split on them.
-//
-// A code written by an older build arrives percent-encoded instead,
-// and is still read: unescaping something that needs no unescaping
-// leaves it alone, so one line covers both and a pair of devices on
-// different builds still pairs.
-function pairFromFragment(fragment) {
-  const at = (fragment || "").indexOf(PAIR_PARAM + "=");
-  if (at === -1) return null;
-  const raw = fragment.slice(at + PAIR_PARAM.length + 1);
-  if (raw.startsWith(PAIR_SCHEME)) return raw;
-  try {
-    const decoded = decodeURIComponent(raw);
-    return decoded.startsWith(PAIR_SCHEME) ? decoded : null;
-  } catch (err) {
-    return null;
-  }
-}
-
-// The pairing a code names, or a refusal somebody can read.
-function readPairingCode(text) {
-  return Keyxfer.parseUri(innerPairingUri(text));
+// The pairing a code names, or a refusal somebody can read. `role` is
+// the role this device has already committed to, where it has: a code
+// from a device in the same position as this one is refused by the
+// parser, in the specification's words rather than in a check each
+// caller makes for itself and one of them forgets.
+function readPairingCode(text, role) {
+  return Keyxfer.parseUri(text, { role });
 }
 
 function isLoopback(host) {
@@ -4602,27 +4549,16 @@ function isLoopback(host) {
     host === "::1" || host === "0.0.0.0" || host.endsWith(".localhost");
 }
 
-// The link the QR draws, built from wherever this copy of Hearth was
-// served from. A copy served by a relay points at that relay and the
-// canonical copy points at itself, so the code never sends anybody to
-// a copy the pair has no reason to be able to reach.
-function pairingLink(uri) {
+// A loopback address means something on this machine and nothing at
+// all on the phone being pointed at it, so a code built here cannot be
+// followed by a camera app. Said on screen rather than left to fail as
+// a page that will not load. The pairing itself still works: a client
+// that reads the code with its own camera never asks the host for
+// anything.
+function pairingReach() {
   const http = location.protocol === "https:" || location.protocol === "http:";
-  if (!http) return { url: uri, reachable: false, reason: "file" };
+  if (!http) return { reachable: false, reason: "file" };
   return {
-    // The URI goes in as itself. Every character it contains — the
-    // plus, the colons, the slashes, the query's own separators — is
-    // legal in a fragment, so escaping them a second time bought
-    // nothing and cost around sixty characters, which is a whole QR
-    // version's worth of density on a code somebody has to point a
-    // camera at. It goes last so that reading it back is everything
-    // after the marker, which is what makes an unescaped ampersand
-    // inside it harmless.
-    url: location.origin + location.pathname + "#" + PAIR_PARAM + "=" + uri,
-    // A loopback address means something on this machine and nothing
-    // at all on the phone being pointed at it, so a code built here
-    // cannot be followed. Said on screen rather than left to fail as
-    // a page that will not load.
     reachable: !isLoopback(location.hostname),
     reason: isLoopback(location.hostname) ? "loopback" : null,
   };
@@ -4861,9 +4797,13 @@ function watchTransport() {
    prompt to say so as well, which renderConsent does. */
 function copyPairingLink() {
   if (!xfer || !xfer.uri) return;
-  // §12.1: the bare URI, not the https link the code carries. This
-  // is the one that can travel in a message, so it is the one that
-  // should not look like something to tap.
+  // §12.1: the same string the code carries, because §11.2 leaves
+  // only one. This used to be a bare qrst:// URI on the argument
+  // that a link in a message invites a tap and a scheme invites
+  // reading; the scheme is gone and that trade with it. What
+  // answers for it now is where it always actually was — a pasted
+  // pairing is never treated as read by this device's camera, so
+  // §9.1's friction fails closed on it whatever it looked like.
   const link = xfer.uri;
   const said = (text) => {
     xPromptEl.textContent = text;
@@ -4912,15 +4852,11 @@ function usePastedLink() {
   if (!text) return;
   let scanned;
   try {
-    scanned = readPairingCode(text);
+    // §11.2's role collision is the parser's to refuse, and this
+    // device has committed to a role by the time it is pasting.
+    scanned = readPairingCode(text, xferRole);
   } catch (err) {
     xFail(err.message);
-    return;
-  }
-  const wantMode = xferRole === "holder" ? "offer" : "request";
-  if (scanned.mode !== wantMode) {
-    xFail("that link is from a device in the same position as this one, so neither of you " +
-      "would be receiving anything");
     return;
   }
   xShow(xPasteRowEl, false);
@@ -5207,9 +5143,16 @@ xCloseBtn.addEventListener("click", closeTransfer);
    has to be guessed from what this device happens to hold.
    ============================================================ */
 function pendingPairing() {
-  if (!pairFromFragment(location.hash.slice(1))) return null;
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  // Enough of the specification's fields to say this fragment is a
+  // pairing rather than an invite code, and no more: whether it is a
+  // good one is the parser's answer, not this function's.
+  if (!fragment.get("mode") || !fragment.get("npub")) return null;
   try {
     // The whole address, through the same reader the camera uses.
+    // No role is committed to here — which side of the transfer this
+    // device is on is settled by the code, not guessed from what this
+    // device happens to hold.
     const scanned = readPairingCode(location.href);
     return { scanned, role: scanned.mode === "offer" ? "holder" : "joiner" };
   } catch (err) {
@@ -5224,11 +5167,12 @@ function pendingPairing() {
 // transfer again, and a bookmark of this page should not carry
 // somebody's pairing parameters around.
 function consumePairing() {
-  // Cut from the marker to the end, which is where the URI is, and
-  // tidy the separator it leaves behind.
-  const fragment = location.hash.slice(1);
-  const at = fragment.indexOf(PAIR_PARAM + "=");
-  const rest = (at === -1 ? fragment : fragment.slice(0, at)).replace(/&$/, "");
+  // The pairing's own fields and nothing else. An invite code in the
+  // same fragment is somebody being let into the group and has
+  // nothing to do with the transfer, so it stays where it was.
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  for (const field of PAIRING_FIELDS) fragment.delete(field);
+  const rest = fragment.toString();
   history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
 }
 
@@ -5385,23 +5329,16 @@ function beginScanning() {
     if (taken) return;
     let scanned;
     try {
-      scanned = readPairingCode(text);
+      // Including §11.2's role collision: a code offering what this
+      // device is offering is the other device in the same role,
+      // which is nobody's transfer, and the parser says so.
+      scanned = readPairingCode(text, xferRole);
     } catch (err) {
       // Read something, cannot use it. Kept on the stats as well as
       // on screen, so the watcher below stops saying it is still
       // looking when it has in fact found and refused something.
       scanStats.lastReason = err.message;
       xFail(err.message);
-      return;
-    }
-    // A code offering what this device is offering is the other
-    // device in the same role, which is nobody's transfer.
-    const wantMode = xferRole === "holder" ? "offer" : "request";
-    if (scanned.mode !== wantMode) {
-      const why = "that code is from a device in the same position as this one, so neither " +
-        "of you would be receiving anything";
-      scanStats.lastReason = why;
-      xFail(why);
       return;
     }
     taken = true;
@@ -5432,9 +5369,12 @@ async function onTransferEvent(type, data) {
   }
 
   if (type === "qr") {
-    const link = pairingLink(data);
-    drawQr(xQrCanvas, link.url);
+    // The URI the session built, drawn as it stands. It is the
+    // specification's own string now rather than one of Hearth's
+    // wrapped around it, so there is nothing here to unwrap.
+    drawQr(xQrCanvas, data);
     xShow(xQrEl, true);
+    const link = pairingReach();
     if (!link.reachable) {
       xMultiEl.textContent = link.reason === "loopback"
         ? "This copy of Hearth is being served from an address that only means something on " +
@@ -5665,9 +5605,7 @@ async function onTransferEvent(type, data) {
    nobody taps "send my key to that browser" without having formed a
    belief about it, and everybody taps "OK". */
 function renderConsent(data) {
-  const claim = data.origin
-    ? "a browser at " + data.origin
-    : (data.plat ? "a " + data.plat + " device" : "a device");
+  const claim = data.origin ? "a browser at " + data.origin : "a device";
   // §9: maximum friction for a web origin, ordinary friction for
   // anything else. Adding a device is a normal thing to do, and an
   // alarm raised every time is one people stop reading — which

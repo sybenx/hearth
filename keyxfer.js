@@ -416,35 +416,88 @@ async function sasCode(senderPubHex, receiverPubHex, nonceSender, nonceReceiver)
 
 /* ============================================================
    the QR (qrst §11.2)
-   ============================================================ */
-const SCHEME = "qrst://";
 
-function buildUri(params) {
-  const npub = KF.bech32.encode("npub", KF.bech32.toWords(fromHex(params.burner)), 5000);
-  const q = new URLSearchParams();
-  q.set("v", VERSION);
-  q.set("mode", params.mode);
-  // Required, and required even though hearth has exactly one:
-  // it is hashed into the code the two devices compare, so a field
-  // that is sometimes absent is two implementations disagreeing
-  // about how to hash nothing.
-  q.set("p", PROFILE);
-  for (const relay of params.relays) q.append("relay", relay);
-  q.set("plat", "web");
-  // Required for plat=web, and the reason the other device's
-  // consent prompt can name a host at all.
-  q.set("origin", params.origin);
-  return SCHEME + npub + "?" + q.toString();
+   An ordinary https link with every parameter in its fragment.
+   There is no custom scheme: "qrst" names the mechanism, not a
+   scheme, and may appear in the path.
+
+   The fragment rather than the query, because a fragment is never
+   sent to a server. The host the link names learns nothing from
+   being asked for the page — not the burner key, not the relay
+   list — and the ordinary path never asks it for anything at all,
+   because a client whose own camera read the code takes the
+   parameters straight out of the string.
+
+   The host matters only for the one case where it has to: a
+   platform camera app, which hands an https link to a browser and
+   an unclaimed scheme to a web search. §11.2a is the page that
+   answers on the other end of it.
+   ============================================================ */
+
+// Legal in a fragment and left alone, because a code somebody has to
+// point a camera at pays for every character: escaping the colons and
+// slashes in four relay URLs costs a whole QR version of density for
+// nothing. Everything else is escaped, including the plus, which a
+// parser reading the fragment back would otherwise take for a space.
+function fragmentValue(text) {
+  return encodeURIComponent(text).replace(/%3A/g, ":").replace(/%2F/g, "/");
 }
 
-function parseUri(text) {
-  if (typeof text !== "string" || !text.startsWith(SCHEME)) {
+// The base is the address the code sends a generic camera to, and is
+// the caller's to choose: it is a property of where this copy is
+// served from rather than of the transfer. The origin is the claim
+// §9.1 makes the other device's consent prompt name, and is required
+// of a web client and omitted by anything else.
+function buildUri(params) {
+  const npub = KF.bech32.encode("npub", KF.bech32.toWords(fromHex(params.burner)), 5000);
+  const fields = [
+    ["v", VERSION],
+    ["mode", params.mode],
+    // Required, and required even though hearth has exactly one:
+    // it is hashed into the code the two devices compare, so a field
+    // that is sometimes absent is two implementations disagreeing
+    // about how to hash nothing.
+    ["p", PROFILE],
+    ["npub", npub],
+  ];
+  for (const relay of (params.relays || []).slice(0, 4)) fields.push(["relay", relay]);
+  if (params.origin) fields.push(["origin", params.origin]);
+  const fragment = fields.map(([k, v]) => k + "=" + fragmentValue(v)).join("&");
+  return stripFragment(params.base) + "#" + fragment;
+}
+
+function stripFragment(base) {
+  const at = String(base || "").indexOf("#");
+  return at === -1 ? String(base || "") : String(base).slice(0, at);
+}
+
+/* The role the showing device holds, from what its code says. A
+   `mode=offer` code is shown by the party obtaining the secret, so
+   whoever scans it is releasing one; `mode=request` is the other way
+   round. Named here because §11.2's role-collision rule is written
+   about it and reads as nothing without it. */
+function modeRole(mode) {
+  return mode === "offer" ? "joiner" : "holder";
+}
+
+// Takes the whole link. `role` is the role this client has already
+// committed to, where it has committed to one, so that a code from a
+// device in the same position as this one is refused now and in
+// words, rather than by a ceremony that completes and moves nothing.
+function parseUri(text, opts) {
+  let url;
+  try {
+    url = new URL(String(text || "").trim());
+  } catch (err) {
     throw new Error("that code isn't a device code");
   }
-  const rest = text.slice(SCHEME.length);
-  const cut = rest.indexOf("?");
-  const npub = cut === -1 ? rest : rest.slice(0, cut);
-  const q = new URLSearchParams(cut === -1 ? "" : rest.slice(cut + 1));
+  // http as well as https, because a copy served over plain http on a
+  // local network is how this is worked on, and refusing it would
+  // refuse the case where two devices are demonstrably in one room.
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("that code isn't a device code");
+  }
+  const q = new URLSearchParams(url.hash.slice(1));
   // A client must refuse a version it does not know, a code that
   // says nothing about which way the key is meant to travel, and a
   // code naming a kind of secret it cannot handle — the last one
@@ -460,9 +513,24 @@ function parseUri(text) {
   if (profile !== PROFILE) {
     throw new Error("that code is moving something hearth doesn't handle (" + profile + ")");
   }
-  const decoded = KF.bech32.decode(npub, 5000);
-  if (decoded.prefix !== "npub") throw new Error("that code isn't a device code");
-  const burner = toHex(Uint8Array.from(KF.bech32.fromWords(decoded.words)));
+  // §11.2: a client that has already committed to a role refuses a
+  // code that would give it the same one. Both devices would be
+  // waiting to receive, or both offering, and neither would ever be
+  // told why.
+  if (opts && opts.role && modeRole(mode) === opts.role) {
+    throw new Error("that code is from a device in the same position as this one, so " +
+      "neither of you would be receiving anything");
+  }
+  const npub = q.get("npub");
+  if (!npub) throw new Error("that code isn't a device code");
+  let burner;
+  try {
+    const decoded = KF.bech32.decode(npub, 5000);
+    if (decoded.prefix !== "npub") throw new Error("prefix");
+    burner = toHex(Uint8Array.from(KF.bech32.fromWords(decoded.words)));
+  } catch (err) {
+    throw new Error("that code isn't a device code");
+  }
   if (burner.length !== 64) throw new Error("that code isn't a device code");
   const relays = q.getAll("relay").slice(0, 4);
   return {
@@ -470,7 +538,6 @@ function parseUri(text) {
     mode,
     profile,
     relays: relays.length > 0 ? relays : DEFAULT_RELAYS.slice(),
-    plat: q.get("plat") || null,
     origin: q.get("origin") || null,
   };
 }
@@ -1063,8 +1130,15 @@ function startSession(opts) {
     emit("consent", {
       peer: peer.burner,
       sas: peer.sas,
-      plat: scanned ? scanned.plat : null,
+      // §9.1: the origin the other device claims, or nothing. There
+      // is no third answer. A peer that states no origin has not
+      // thereby said it is native — its nature is simply unestablished
+      // — and the friction tier fails closed on that, which is the
+      // caller's rule to apply rather than this file's to soften.
       origin: scanned ? displayOrigin(scanned.origin) : null,
+      // Whether this session's pairing was read by this device's own
+      // camera is something only the caller knows: a fragment on a
+      // page load looks the same whichever app put it there.
     });
   }
 
@@ -1280,7 +1354,17 @@ function startSession(opts) {
         burner: burner.pub,
         mode: role === "joiner" ? "offer" : "request",
         relays,
-        origin: global.location ? global.location.host : "",
+        // Where the code sends a camera that is not a client of this
+        // specification: this copy of whatever is running it, by
+        // default, which is the only address it can know is serving
+        // the page it is part of.
+        base: opts.base || (global.location
+          ? global.location.origin + global.location.pathname : ""),
+        // Required of a web client and omitted by anything else
+        // (§11.2). A caller that is not a browser passes null.
+        origin: opts.origin !== undefined
+          ? opts.origin
+          : (global.location ? global.location.host : null),
       });
       emit("qr", session.uri);
       return;
@@ -1338,6 +1422,7 @@ global.Keyxfer = {
   signWith,
   buildUri,
   parseUri,
+  modeRole,
   displayOrigin,
   startSession,
   toHex,
