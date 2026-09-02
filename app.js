@@ -5788,20 +5788,22 @@ function renderConsent(data) {
    a list arriving a moment later arrived nowhere. Now it cannot
    arrive separately, because it is not separate.
 
-   `relays` is not a tag the `nostr-nsec` profile defines, so no other
-   client will send or read it, and §5 requires them to ignore it.
-   Proposed to the specification as a registered tag on that profile.
-   Listed as tag elements rather than as JSON in one, because a tag is
-   already a list of strings and JSON inside one is a second encoding
-   for nothing. */
-const RELAYS_TAG = "relays";
+   One tag per relay, named `relay`, which is what the QR's own
+   parameter is called and what a nostr tag usually looks like. Not a
+   tag the `nostr-nsec` profile defines, so no other client will send
+   or read one and §5 requires them to ignore it — proposed to the
+   specification in that shape, since a device that arrives holding a
+   key and no idea where its group is was the case the whole transfer
+   existed to avoid. */
+const RELAY_TAG = "relay";
+const RELAYS_SENT_MAX = 8;
 
 async function sendKey(data) {
   xRender({ title: "add a device", sas: data.sas, waiting: "sending" });
-  const relays = rememberedRelays().slice(0, 8);
+  const relays = rememberedRelays().slice(0, RELAYS_SENT_MAX);
   await xfer.approve(data.peer, S.utils.bytesToHex(identity.privkey), {
     lock: "device",
-    tags: relays.length > 0 ? [[RELAYS_TAG].concat(relays)] : [],
+    tags: relays.map((url) => [RELAY_TAG, url]),
   });
 }
 
@@ -5856,9 +5858,12 @@ async function keepReceivedKey(peerHex) {
   // With this list in hand the reload below goes straight into the
   // group and asks nothing. There is no waiting for it any more: it
   // arrived on the key or it did not exist.
-  const sent = (record.tags || []).find((t) => t[0] === RELAYS_TAG) || [];
-  for (const url of sent.slice(1).reverse()) {
-    if (typeof url === "string" && /^wss?:\/\//.test(url)) rememberRelay(url);
+  const sent = (record.tags || [])
+    .filter((t) => t[0] === RELAY_TAG && typeof t[1] === "string")
+    .map((t) => t[1])
+    .slice(0, RELAYS_SENT_MAX);
+  for (const url of sent.reverse()) {
+    if (/^wss?:\/\//.test(url)) rememberRelay(url);
   }
   // The profile's `lock` tag travels with the key. Hearth has one
   // behaviour today, the default, and stores what arrived so that

@@ -52,7 +52,7 @@ that does have it, offers a signing extension beside that, and keeps the relay a
 field at the bottom for the person who has neither.
 
 A device that has just been handed an identity is also told where the group is: the
-sending device's relay list rides on the key itself, as a tag on the one message the
+sending device's relay list rides on the key itself, as tags on the one message the
 transfer carries. Without it the device would have the account and no idea which relay to
 ask, and the first thing it showed would be the address field that the whole transfer
 existed to avoid. It travelled as a second message once, until the specification settled on
