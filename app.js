@@ -5320,9 +5320,14 @@ function beginShowing() {
   // after that would clear the canvas it was just drawn on.
   xRender({
     title: showing ? "your new device" : "add a device",
+    // §11.2b: never a bare code. The line beside it says which way
+    // the key goes and that it is the key that goes, because a code
+    // with nothing beside it is one somebody scans to find out what
+    // it was for.
     note: showing
-      ? "Scan this with the device that already has your identity."
-      : "Scan this with the device you're adding.",
+      ? "Scan this with the device that already has your identity. Scanning it sends that " +
+        "device's key here, for good."
+      : "Scan this with the device you're adding. It will receive this device's key.",
     waiting: "waiting for your other device",
     alts: [
       { label: "scan the code it shows instead",
@@ -5424,6 +5429,10 @@ async function onTransferEvent(type, data) {
     // wrapped around it, so there is nothing here to unwrap.
     drawQr(xQrCanvas, data);
     xShow(xQrEl, true);
+    // §11.2b: the two directions must not look alike. A code this
+    // device shows to receive a key is one whose scanner gives theirs
+    // away, and that is the heavier of the two by a long way.
+    xQrEl.classList.toggle("release", xferRole === "joiner");
     const link = pairingReach();
     if (!link.reachable) {
       xMultiEl.textContent = link.reason === "loopback"

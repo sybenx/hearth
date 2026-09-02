@@ -752,6 +752,14 @@ input{font:inherit;color:inherit;background:none;border:none}
 .xNote{font-size:12.5px;line-height:1.55;color:var(--dim)}
 .xPrompt{font-size:14px;line-height:1.5;color:var(--ink)}
 .xQr{background:var(--ink);padding:10px;border-radius:12px;line-height:0;width:100%}
+/* qrst §11.2b: release and receipt must not look alike. A code that
+   makes whoever scans it the one whose key leaves carries visibly more
+   weight than one that only asks for a key to arrive. Not a badge, a
+   seal or a tick — §11.2b forbids anything that reads as assurance,
+   and this is the opposite of assurance. */
+.xQr.release{
+  padding:14px;box-shadow:0 0 0 2px var(--ember),0 0 22px -6px var(--ember);
+}
 /* As wide as the panel allows. The code carries a link now rather
    than a bare URI, so it has more in it than it used to, and every
    pixel per module is a pixel the camera on the other phone does not
