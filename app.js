@@ -5612,13 +5612,39 @@ async function onTransferEvent(type, data) {
    key. The one that sends says what it does rather than agreeing:
    nobody taps "send my key to that browser" without having formed a
    belief about it, and everybody taps "OK". */
+/* §9.1's friction tier, written as the rule rather than as its
+   answer.
+
+   Standard friction needs both halves: a peer that positively
+   presents as a native application, and a pairing this device's own
+   camera read. Everything else draws the maximum, including a peer
+   that has said nothing about what it is — §9.1 is explicit that an
+   unlabelled peer gets the web tier and never the benefit of the
+   doubt, because a client that reaches a sender by a pasted request
+   rather than a scanned code would otherwise be handled as native
+   for having declared nothing.
+
+   §11.2 gives a peer no way to make the native claim: `origin` is
+   required of a web client and omitted by everything else, so its
+   absence is exactly the unestablished case. So this returns the
+   maximum today whatever it is handed. It is here as the rule
+   because the day a binding carries a native claim, this is the one
+   line that changes. */
+function frictionTier() {
+  const claimsNative = false;
+  return (claimsNative && xferFromOwnCamera) ? "standard" : "maximum";
+}
+
 function renderConsent(data) {
-  const claim = data.origin ? "a browser at " + data.origin : "a device";
-  // §9: maximum friction for a web origin, ordinary friction for
-  // anything else. Adding a device is a normal thing to do, and an
-  // alarm raised every time is one people stop reading — which
-  // leaves nothing for the case that is almost always an attack.
-  const web = !!data.origin;
+  // §9.1: what the other party claims to be. A browser's origin, or
+  // — since there is no third thing it can say — that it has not
+  // said. Calling it a native application here would be inventing a
+  // claim on its behalf.
+  const claim = data.origin
+    ? "a browser at " + data.origin
+    : "a device that hasn't said what it is";
+  const named = data.origin || "that device";
+  const maximum = frictionTier() === "maximum";
   // §12.1 and §11.2a: a code held up to a camera means somebody put
   // it in front of you. A link that arrived some other way means
   // nothing of the sort, and this device cannot tell a camera app
@@ -5649,17 +5675,24 @@ function renderConsent(data) {
             title: "This is not a login",
             prompt: "You are about to give " + claim + " your key.",
             note: "That's the right device. Sending is the last step and it cannot be undone.",
-            ack: web ? {
-              label: "I mean to give my key to " + data.origin + ", and I know it keeps a " +
+            // §9.1: at maximum friction the prompt asks for a
+            // deliberate act beyond the one tap. The tick is what
+            // arms the control; without it the control does nothing.
+            ack: maximum ? {
+              label: "I mean to give my key to " + named + ", and I know it keeps a " +
                 "working copy for good",
               onChange: (on) => { xAckSend = on ? send : null; },
             } : null,
             buttons: [
               decline,
-              web
-                ? { label: "send my key to " + data.origin, quiet: true,
+              // §9.1: the control that sends describes the transfer
+              // rather than agreeing to it, and names the origin
+              // where one is claimed. It is never the loud one, is
+              // never focused, and answers no default keypress.
+              maximum
+                ? { label: "send my key to " + named, quiet: true,
                     onClick: () => { if (xAckSend) xAckSend(); } }
-                : { label: "send my key to that device", quiet: true, onClick: send },
+                : { label: "send my key to " + named, quiet: true, onClick: send },
             ],
           });
           return;
