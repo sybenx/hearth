@@ -4739,7 +4739,15 @@ function watchTransport() {
 
     let message = null;
     let actionable = false;
-    if (health.live === 0) {
+    // §11.6: every relay this session had said it will not carry a
+    // message this size, so there is nothing left to keep trying and
+    // waiting out ten minutes would say nothing this does not.
+    if (health.usable === 0) {
+      message = "None of the relays Hearth would use for this will carry a message this " +
+        "size. Nothing was sent.";
+      actionable = true;
+      recordTransport(health);
+    } else if (health.live === 0) {
       if (waited >= TRANSPORT_TROUBLE_MS) {
         message = "Hearth still hasn't got a connection. It keeps trying, so this may come " +
           "good on its own, and starting again is worth a go if it doesn't.";

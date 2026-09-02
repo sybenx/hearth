@@ -564,6 +564,10 @@ function displayOrigin(origin) {
 function relayPool(urls, burner, since, onEvent, onHealth) {
   const sockets = new Map();
   const seen = new Set();
+  // §11.6: relays that have said they will not carry a message this
+  // size. Dropped for the life of the session rather than retried,
+  // because the answer will not change.
+  const skipped = new Set();
   // Everything this session has published, kept so that a relay
   // whose socket opened late, or which asked for authentication
   // first, still receives the messages that went out before it was
@@ -589,9 +593,17 @@ function relayPool(urls, burner, since, onEvent, onHealth) {
 
   function summary() {
     let live = 0;
-    for (const row of health.values()) if (row.status === "open") live++;
+    let usable = 0;
+    for (const row of health.values()) {
+      if (row.status === "open") live++;
+      if (row.status !== "skipped") usable++;
+    }
     return {
       live,
+      // Every relay this session may still use. A relay skipped under
+      // §11.6 is not one of them, and a screen counting it would say
+      // it is still waiting on something that is never coming.
+      usable,
       total: health.size,
       elapsedMs: Date.now() - startedAt,
       relays: Array.from(health, ([url, row]) => Object.assign({ url }, row)),
@@ -637,7 +649,7 @@ function relayPool(urls, burner, since, onEvent, onHealth) {
   // needs to handle. Backoff so a relay that is genuinely down is
   // not hammered for ten minutes.
   function retry(url, reason) {
-    if (closed) return;
+    if (closed || skipped.has(url)) return;
     const row = health.get(url);
     const delay = Math.min(8000, 1000 * Math.pow(2, Math.min(row.attempts - 1, 3)))
       + Math.floor(Math.random() * 400);
@@ -646,7 +658,7 @@ function relayPool(urls, burner, since, onEvent, onHealth) {
   }
 
   function connect(url) {
-    if (closed) return;
+    if (closed || skipped.has(url)) return;
     const row = health.get(url);
     row.attempts++;
     const began = Date.now();
@@ -733,7 +745,27 @@ function relayPool(urls, burner, since, onEvent, onHealth) {
     });
   }
 
-  for (const url of health.keys()) connect(url);
+  /* §11.6, run beside the connecting rather than in front of it. The
+     screen is up either way — §11.3 is emphatic that a probe does not
+     get to close out a session — so this is a relay being dropped
+     when its answer arrives, not a gate anything waits behind. */
+  function checkSize(url) {
+    relayLimits(url).then((limits) => {
+      if (closed) return;
+      const why = tooSmall(limits);
+      if (!why) return;
+      skipped.add(url);
+      const ws = sockets.get(url);
+      if (ws) { try { ws.close(); } catch (e) {} sockets.delete(url); }
+      note(url, { status: "skipped", lastReason: why, subscribed: false, retryInMs: null });
+    }).catch(() => {
+      // A document that would not load says nothing about what the
+      // relay carries. §11.6 skips a stated ceiling, and silence is
+      // not one.
+    });
+  }
+
+  for (const url of health.keys()) { connect(url); checkSize(url); }
 
   return {
     publish(event) {
@@ -758,25 +790,82 @@ function relayPool(urls, burner, since, onEvent, onHealth) {
   };
 }
 
-/* §3.1 and what a browser can do about it.
+/* the probe (qrst §11.3, §11.6)
 
-   The specification probes for a transport before showing any
-   transfer screen, and picks between relays, the local network and
-   an off-grid code from what comes back. A browser has none of that
-   choice: it cannot do the local path in either role, and it cannot
-   be the off-grid holder either, so the only two outcomes a probe
-   can produce here are "relays" and "nothing at all" — and there is
-   no behaviour behind the second one.
+   §11.3 asks for a probe before the transfer screen goes up, and
+   then says what it is for: it is advisory, not selective. A
+   three-second probe must not close out a ten-minute session, so the
+   screen goes up regardless, an unreachable relay is re-attempted
+   for the whole of the session's remaining life, the flow proceeds
+   the moment one becomes reachable, and failure is reported only at
+   expiry. That is what the pool above does — it starts connecting
+   when the session does and keeps at it — and how it is getting on
+   is something the screen reports rather than something the session
+   rules on.
 
-   A one-shot probe with a three-second timeout therefore decided the
-   fate of a session the specification gives ten minutes, and decided
-   it against exactly the case that most needs handling: a first,
-   cold WebSocket to a public relay, which Safari can take longer
-   over than any timeout worth setting. So there is no probe. The
-   pool above starts connecting the moment a session does and keeps
-   at it for as long as the session lives, the flow proceeds as soon
-   as one relay is up, and how it is getting on is something the
-   screen reports rather than something the session rules on. */
+   The part of the probe that does decide something is §11.6. A relay
+   that says in its NIP-11 document that it cannot carry the profile's
+   maximum message is skipped, because it will accept the handshake
+   and then drop the one message that matters. A relay that declares
+   no limit is kept: the rule is for a stated ceiling, and an absent
+   one is not a small one.
+
+   For this profile the check will essentially never bind. The
+   payload is sixty-four characters and the ceiling is two kilobytes,
+   three orders of magnitude apart, and the default was chosen to be
+   the figure every operator observed already carries. It is here
+   because a client that skips it passes on a profile with a larger
+   maximum, and because a relay that declares a small limit is worth
+   naming on the screen rather than leaving as a socket that opens
+   and then silently swallows the key. */
+
+// §4 P1: the default maximum, which `nostr-nsec` takes as its own.
+const MAX_PAYLOAD_BYTES = 2048;
+// §11.6's own arithmetic: a `max_content_length` of 8196 carries a
+// 2082-byte payload, so the content field costs a little under four
+// bytes for every byte of payload. Derived from the table rather than
+// from the ×3.4 figure beside it, because that one measures the whole
+// published event and this limit caps the content field alone.
+const REQUIRED_CONTENT_LENGTH = Math.ceil(MAX_PAYLOAD_BYTES * 8196 / 2082);
+// The same, plus what the event around it and the relay frame cost:
+// an id, a signature, a pubkey, the tags and the JSON holding them.
+// Five hundred bytes covers it and this is four times that, because
+// being generous here skips fewer relays and the figure it is
+// protecting against is an order of magnitude below either.
+const REQUIRED_MESSAGE_LENGTH = REQUIRED_CONTENT_LENGTH + 2048;
+
+// NIP-11 is served over http from the relay's own address.
+function nip11Url(relayUrl) {
+  return relayUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
+}
+
+// What the relay says it will carry, or nothing. Nothing is the
+// ordinary answer — a document that will not load, a relay that
+// serves no CORS header, a field it does not declare — and it is
+// deliberately not a reason to skip anything.
+async function relayLimits(relayUrl) {
+  if (typeof global.fetch !== "function") return null;
+  const response = await global.fetch(nip11Url(relayUrl), {
+    headers: { Accept: "application/nostr+json" },
+  });
+  if (!response.ok) return null;
+  return await response.json();
+}
+
+// A stated ceiling this profile does not fit under, in words a
+// screen can show, or null for a relay that is fine or silent.
+function tooSmall(limits) {
+  if (!limits || typeof limits !== "object") return null;
+  const content = Number(limits.max_content_length);
+  if (Number.isFinite(content) && content > 0 && content < REQUIRED_CONTENT_LENGTH) {
+    return "carries messages of at most " + content + " bytes";
+  }
+  const message = Number(limits.max_message_length);
+  if (Number.isFinite(message) && message > 0 && message < REQUIRED_MESSAGE_LENGTH) {
+    return "carries messages of at most " + message + " bytes";
+  }
+  return null;
+}
 
 /* ============================================================
    what a failed code costs (qrst §9)
