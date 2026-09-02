@@ -79,13 +79,6 @@ const KINDS = {
   ABORT: 24407,
 };
 
-// The kinds this file speaks. Anything else inside a session is the
-// caller's own and is handed to it untouched.
-const KNOWN_KINDS = new Set([
-  KINDS.HELLO, KINDS.REQUEST, KINDS.PAYLOAD,
-  KINDS.ACK, KINDS.NONCE, KINDS.REVEAL, KINDS.ABORT,
-]);
-
 const VERSION = "1";              // the QR's v= (§11.2)
 // The same number as a single byte, which is what §6 hashes. It is a
 // field in the transcript rather than a suffix on the label because a
@@ -1161,7 +1154,11 @@ function startSession(opts) {
       // to the identity that came with it: without that, whoever
       // photographed the QR could race the real holder and put
       // their own key on this device.
-      peer.held = { hex, lock: tagValue(rumor.tags, "lock") || "device" };
+      // The tags come up with it. §5 item 6: a profile may put its own
+      // on any message, and this file has no idea what they mean —
+      // `lock` is pulled out because the profile the specification
+      // registers defines it, and the rest are handed on whole.
+      peer.held = { hex, lock: tagValue(rumor.tags, "lock") || "device", tags: rumor.tags || [] };
       maybeArrived(peer);
       return;
     }
@@ -1181,19 +1178,6 @@ function startSession(opts) {
       return;
     }
 
-    /* ---- anything else this file does not speak ---- */
-    // A client may carry its own messages inside a session it has
-    // already established — this file has no opinion on what, and
-    // hands them up rather than dropping them. Only ever from a
-    // burner already talking to us, and only after the same checks
-    // every other rumor passes.
-    if (!KNOWN_KINDS.has(rumor.kind)) {
-      if (peers.has(from)) {
-        emit("rumor", { kind: rumor.kind, tags: rumor.tags, content: rumor.content, from });
-      }
-      return;
-    }
-
     /* ---- the receipt that lets a holder let go ---- */
     if (rumor.kind === KINDS.ACK) {
       if (role !== "holder") return;
@@ -1202,6 +1186,14 @@ function startSession(opts) {
       stop("done");
       return;
     }
+
+    /* ---- anything else ---- */
+    // Dropped, and there used to be a way to hand it up. P2: one
+    // payload, one session, and a session carries exactly one message
+    // with meaning to the profile. §11.4 says the same from the other
+    // end — there is no side-channel for additional profile messages.
+    // A client with something to send alongside the key sends it as a
+    // tag on the payload, which is what §5 item 6 is for.
   }
 
   // Both nonces are in, so both devices can work out the same five
@@ -1403,14 +1395,21 @@ function startSession(opts) {
     // Holder, both flows: release the key to this peer. Reached
     // only after the code was entered and matched, and then only
     // from a deliberate tap on the device that holds it.
-    async approve(peerHex, privkeyHex, lock) {
+    async approve(peerHex, privkeyHex, opts) {
       const peer = peers.get(peerHex);
       if (!peer || !peer.sas || finished) return;
       // The gate, and it is here rather than on the screen so that
       // no arrangement of buttons can get past it.
       if (!peer.verified) return;
       peer.sent = true;
-      await send(KINDS.PAYLOAD, [["lock", lock || "device"]], privkeyHex, peerHex);
+      // §5 item 6: the caller's own tags ride the payload, because
+      // P2 leaves nowhere else for them. They must not collide with
+      // `commit` or `nonce`, which are the specification's; this file
+      // does not police that, since a profile is what says which tags
+      // it defines and the reserved names are not among them.
+      const extra = (opts && opts.tags) || [];
+      const lock = (opts && opts.lock) || "device";
+      await send(KINDS.PAYLOAD, [["lock", lock]].concat(extra), privkeyHex, peerHex);
       emit("sent", { peer: peerHex, sas: peer.sas });
       // §7 step 18 and §8 step 18: the burner goes when the other
       // device says it has the key, or a minute later regardless.
@@ -1482,6 +1481,8 @@ function startSession(opts) {
       const record = {
         privkeyHex: held.hex,
         lock: held.lock,
+        // Whatever else the profile put on the payload. Opaque here.
+        tags: held.tags,
         sas: peer.sas,
         peer: peerHex,
         multi: multiSeen,
@@ -1492,15 +1493,6 @@ function startSession(opts) {
       // covers it either way.
       setTimeout(() => stop("done"), 400);
       return record;
-    },
-
-    // The caller's own message, to a burner this session is already
-    // talking to. Same seal, same wrap, same session; this file does
-    // not look inside it.
-    //
-    async sendTo(peerHex, kind, tags, content) {
-      if (!peers.has(peerHex) || finished) return 0;
-      return await send(kind, tags || [], content, peerHex);
     },
 
     cancel() { stop("cancelled"); },

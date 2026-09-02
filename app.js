@@ -4968,9 +4968,6 @@ let xferShowing = false;
 // of the sort, and this device cannot tell which app handed it a
 // fragment on a page load. False means the release prompt says so.
 let xferFromOwnCamera = true;
-// Where the group is, as told by each device offering a key, kept
-// beside the key itself until one of them is accepted.
-const xferRelays = new Map();
 
 function xShow(el, on) { el.hidden = !on; }
 
@@ -5527,21 +5524,6 @@ async function onTransferEvent(type, data) {
     return;
   }
 
-  // The other device saying where the group is. Held rather than
-  // written down: until the person has agreed to the identity that
-  // arrived, this is a stranger's list of servers and has no business
-  // on this device.
-  if (type === "rumor") {
-    if (data.kind !== KINDS.ROOM_RELAYS) return;
-    try {
-      const parsed = JSON.parse(data.content);
-      if (Array.isArray(parsed.relays)) xferRelays.set(data.from, parsed.relays);
-    } catch (err) {
-      // A list that will not parse is a list this device does without.
-    }
-    return;
-  }
-
   if (type === "sent") {
     // Kept for a transfer that worked but took its time. The
     // interesting report is not only the one that failed.
@@ -5779,21 +5761,39 @@ function renderConsent(data) {
   });
 }
 
+/* The relays this device has reached the group on, carried on the
+   payload itself.
+
+   A device holding a key and no idea where the group is would land on
+   a box asking for a server address, which is precisely what somebody
+   who just held two phones together was spared. It used to travel as
+   a second message in the same session. qrst 1.0 allowed that and 1.2
+   took it away: P2 is now one payload, one session, and §11.4 says
+   there is no side-channel for additional profile messages.
+
+   A tag is what is left, and it is the better shape anyway. §5 item 6
+   is exactly this — a profile's own tags, on a message the mechanism
+   does not read — and it is how `lock` and `enroll` already travel.
+   It also fixes something the second message was always racing: the
+   far side stores the key and reloads the moment its owner agrees, so
+   a list arriving a moment later arrived nowhere. Now it cannot
+   arrive separately, because it is not separate.
+
+   `relays` is not a tag the `nostr-nsec` profile defines, so no other
+   client will send or read it, and §5 requires them to ignore it.
+   Proposed to the specification as a registered tag on that profile.
+   Listed as tag elements rather than as JSON in one, because a tag is
+   already a list of strings and JSON inside one is a second encoding
+   for nothing. */
+const RELAYS_TAG = "relays";
+
 async function sendKey(data) {
   xRender({ title: "add a device", sas: data.sas, waiting: "sending" });
-  await xfer.approve(data.peer, S.utils.bytesToHex(identity.privkey), "device");
-  // Straight after the key, in the same session, to the same burner:
-  // the relays this device has reached this room on. A device holding
-  // a key and no idea where the group is would land on a box asking
-  // for a server address, which is precisely what somebody who just
-  // held two phones together was spared. Sent immediately rather than
-  // waiting for the receipt, because the far side stores the key and
-  // reloads the moment its owner agrees, and a message that arrives
-  // after that reload arrives nowhere.
   const relays = rememberedRelays().slice(0, 8);
-  if (relays.length > 0) {
-    await xfer.sendTo(data.peer, KINDS.ROOM_RELAYS, [], JSON.stringify({ relays }));
-  }
+  await xfer.approve(data.peer, S.utils.bytesToHex(identity.privkey), {
+    lock: "device",
+    tags: relays.length > 0 ? [[RELAYS_TAG].concat(relays)] : [],
+  });
 }
 
 // §7 steps 15 and 16, §8 step 16: the key is in hand and still not
@@ -5834,13 +5834,6 @@ async function keepReceivedKey(peerHex) {
   xRender({ title: "your new device", waiting: "keeping it" });
   // Before the reload below takes this page away with it.
   recordTransport(xfer.transport());
-  // The two messages were sent together but travel separately, and
-  // the second one is what saves this device from asking for a server
-  // address. Worth a moment before giving up on it, and no longer,
-  // because the key is the part that matters and it is already here.
-  for (let i = 0; i < 30 && !xferRelays.has(peerHex); i++) {
-    await new Promise((r) => setTimeout(r, 100));
-  }
   const record = await xfer.accept(peerHex);
   if (!record) {
     xFail("that key is no longer being offered");
@@ -5848,11 +5841,14 @@ async function keepReceivedKey(peerHex) {
   }
   await storeSealedPrivkey(S.utils.hexToBytes(record.privkeyHex));
   localStorage.removeItem(SIGNER_CHOICE_KEY);
-  // Remembered exactly as a relay this device had reached would be,
-  // last first, so the other device's first choice ends up this
-  // device's first choice. With this list in hand the reload below
-  // goes straight into the group and asks nothing.
-  for (const url of (xferRelays.get(peerHex) || []).slice().reverse()) {
+  // Where the group is, off the payload's own tag. Remembered exactly
+  // as a relay this device had reached would be, last first, so the
+  // other device's first choice ends up this device's first choice.
+  // With this list in hand the reload below goes straight into the
+  // group and asks nothing. There is no waiting for it any more: it
+  // arrived on the key or it did not exist.
+  const sent = (record.tags || []).find((t) => t[0] === RELAYS_TAG) || [];
+  for (const url of sent.slice(1).reverse()) {
     if (typeof url === "string" && /^wss?:\/\//.test(url)) rememberRelay(url);
   }
   // The profile's `lock` tag travels with the key. Hearth has one
