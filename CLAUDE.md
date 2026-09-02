@@ -132,6 +132,49 @@ collision, but no NIP has reserved them yet, so a build of Hearth pairs with a b
 Hearth and with nothing else until one does. They change only if that process asks, which
 is not the same as expecting them to churn.
 
+## Splitting the key
+
+Nostr has no rotation. A key that gets out is out, and the only repair is social:
+announce a new one from the old one while you still control it, and lose the follower
+graph, the attribution on everything already said, and every reference anybody holds.
+Threshold signing is the one thing that changes that going forward, so it is worth
+having even though nothing about it repairs anything backwards.
+
+Hearth splits a key across the person's own devices and nowhere else. Any two of them
+sign together, none signs alone, and there is no server in the signing path — which is
+the same reason there is no server anywhere else here. The specification describes a
+second arrangement where a server holds one of the shares, and that one is better in
+several ways that matter to somebody else: it gives instant revocation, rules a server
+can enforce, and a way to log in on a machine you do not own. It also requires somebody
+to run it, which is the thing hearth is for not doing.
+
+The specification says every device that is a browser is restricted, and a restricted
+device may never hold a share of this kind. Hearth deviates from that, deliberately and
+in one place: an installed hearth — one the person has added to their home screen, that
+opens on its own rather than in a tab — can be marked as one of the devices the key is
+split across. A hearth in an ordinary browser tab cannot, and is not offered.
+
+Two things keep that narrow. A device never grants itself the mark: the box is on the
+device sending the share, it names the device receiving it, and it starts unticked, so
+the person deciding is the one who already has the key rather than the one asking for a
+piece of it. And an installed hearth that stops being installed stops doing the things
+only those devices do — sending a share, admitting or removing a device, starting a
+re-key. It goes on signing, because its share cannot be taken back and refusing would
+cost the person their own key over an uninstall; it says what has happened instead, and
+recommends the re-key that would actually remove it.
+
+What this does not do is make a tab unable to reach what an installed copy stores.
+Browser storage belongs to the address, not to the window, so this is a rule about what
+a device will do rather than a wall around what a tab can read. The wall is the prompt
+in front of everything that touches the key itself — who holds it, where a copy goes,
+what protects it — which is a passkey the person is asked for and not something a script
+on the page can answer.
+
+Without the deviation none of the above exists here at all. A device list with no
+trusted device in it never reaches the screen that offers to split a key, never sets up
+a backup, and has no way to recover one, so the whole of it would be closed to the kind
+of client the transfer half of the same specification goes out of its way to serve.
+
 ## What is private and what is not
 
 Public channels are readable by the relay. That is deliberate, and it is what gives the
