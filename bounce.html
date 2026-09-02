@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hearth &mdash; bounce page check</title>
+<style>
+body{
+  margin:0;padding:28px 20px 60px;background:#0b0907;color:#f0e6d9;
+  font:14px/1.6 ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+}
+h1{font:600 15px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0 0 6px}
+p.note{
+  font:12.5px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  color:#b3a08b;max-width:68ch;margin:0 0 22px;
+}
+#summary{font-weight:600;margin:0 0 16px;padding:10px 12px;border-radius:10px;background:#1d1510}
+.ok{color:#8fbf7a}
+.bad{color:#ff6d5a}
+ul{list-style:none;margin:0;padding:0}
+li{padding:3px 0;border-bottom:1px solid rgba(240,220,196,.06)}
+li .detail{display:block;color:#82705d;font-size:12px;white-space:pre-wrap;word-break:break-all}
+iframe{width:390px;height:640px;border:1px solid rgba(240,220,196,.12);border-radius:12px;margin-top:24px}
+</style>
+</head>
+<body>
+<h1>bounce page check</h1>
+<p class="note">qrst &sect;11.2a makes hearth&rsquo;s own index.html the page a generic camera
+  app opens, because every bothy serves a copy and the code carries an ordinary https link.
+  The section&rsquo;s whole point is that the fragment never reaches a server: the page reads
+  its own parameters, asks the visitor whether this is the copy they use, and until they say
+  so it does nothing. This loads index.html on a pairing link and checks that it does nothing
+  &mdash; no relay, no NIP-11, no version check. Serve this page over http and open it; a red
+  line means a visitor who followed somebody&rsquo;s pairing link told this host they were
+  here.</p>
+<p class="note">One limit, stated rather than hidden: a socket opened before the frame
+  finished loading would not appear below, because resource timing does not record
+  WebSockets and nothing can patch a window before its own first script runs. What stands in
+  for it is the last check &mdash; opening a socket is downstream of hearth&rsquo;s boot, and
+  the boot has demonstrably not run in this frame.</p>
+<div id="summary">running&hellip;</div>
+<ul id="results"></ul>
+<iframe id="frame" title="index.html on a pairing link"></iframe>
+
+<script>
+const results = document.getElementById("results");
+let pass = 0, fail = 0;
+
+function record(name, ok, detail) {
+  if (ok) pass++; else fail++;
+  const li = document.createElement("li");
+  li.innerHTML = '<span class="' + (ok ? "ok" : "bad") + '">' + (ok ? "pass" : "FAIL") + "</span> " + name;
+  if (!ok && detail) {
+    const d = document.createElement("span");
+    d.className = "detail";
+    d.textContent = detail;
+    li.appendChild(d);
+  }
+  results.appendChild(li);
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A pairing link of the shape §11.2 defines, pointing at this copy.
+// The burner is a fixture and belongs to nobody.
+const PAIRING =
+  "#v=1&mode=offer&p=nostr-nsec" +
+  "&npub=npub1wgygs9yzezv4w288vcemehcwhdj32hy0f9u6femxwylnwjjas9fq85phnw" +
+  "&relay=wss://relay.damus.io&origin=example.invalid";
+
+function buttonLabels(doc) {
+  return Array.from(doc.querySelectorAll("#xButtons button")).map((b) => b.textContent);
+}
+
+(async function run() {
+  const frame = document.getElementById("frame");
+  const loaded = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
+  frame.src = "index.html" + PAIRING;
+  await loaded;
+  // Long enough for anything the page meant to do on load to have
+  // started doing it.
+  await wait(1500);
+
+  const win = frame.contentWindow;
+  const doc = frame.contentDocument;
+
+  // Positive first: a page that failed to load makes no requests
+  // either, and would otherwise pass every check below.
+  const labels = buttonLabels(doc);
+  record("the page read its fragment and asked", labels.includes("carry on here"),
+    "buttons: " + JSON.stringify(labels));
+  record("the transfer panel is the thing on screen", doc.getElementById("xfer") &&
+    !doc.getElementById("xfer").hidden);
+
+  // Everything the frame asked the network for. Resource timing
+  // covers fetch, XHR and every subresource; what it will not show is
+  // a WebSocket, which is what the last check is for.
+  const entries = win.performance.getEntriesByType("resource");
+  const requests = entries.filter((e) =>
+    e.initiatorType === "fetch" || e.initiatorType === "xmlhttprequest" ||
+    e.initiatorType === "beacon");
+  record("nothing was fetched", requests.length === 0,
+    requests.map((e) => e.initiatorType + " " + e.name).join("\\n"));
+
+  const here = location.origin;
+  const offsite = entries.filter((e) => {
+    try { return new URL(e.name).origin !== here; } catch (err) { return true; }
+  });
+  record("nothing was loaded from anywhere but this host", offsite.length === 0,
+    offsite.map((e) => e.name).join("\\n"));
+
+  // From here on, anything the frame reaches for is recorded rather
+  // than allowed. A patch cannot be installed before the frame's own
+  // first script, so this covers the settled page and the note above
+  // covers the rest.
+  const reached = [];
+  const realFetch = win.fetch;
+  win.fetch = function (input) { reached.push("fetch " + input); return realFetch.apply(this, arguments); };
+  const RealSocket = win.WebSocket;
+  win.WebSocket = function (url) { reached.push("websocket " + url); return new RealSocket(url); };
+  const RealXhr = win.XMLHttpRequest;
+  win.XMLHttpRequest = function () {
+    const xhr = new RealXhr();
+    const open = xhr.open;
+    xhr.open = function (method, url) { reached.push("xhr " + url); return open.apply(xhr, arguments); };
+    return xhr;
+  };
+  if (win.navigator.sendBeacon) {
+    win.navigator.sendBeacon = function (url) { reached.push("beacon " + url); return false; };
+  }
+  await wait(2000);
+  record("nothing was reached for while it waited", reached.length === 0, reached.join("\\n"));
+
+  // Arranging the call view is one of the first things hearth's boot
+  // does, and nothing else does it: the markup ships without that
+  // class. Its absence says the boot has not run in this frame, which
+  // is what stands in for the socket resource timing cannot see —
+  // opening one is downstream of everything this proves did not
+  // happen. Frame-scoped on purpose: anything read out of storage
+  // would answer for every visit this browser has ever made to this
+  // host rather than for this one.
+  const hearthEl = doc.getElementById("hearth");
+  record("hearth itself has not started",
+    !!hearthEl && !hearthEl.classList.contains("expanded"),
+    hearthEl ? "the call view reads " + JSON.stringify(hearthEl.className) : "no call view");
+
+  // §11.2a: a visitor who is not using this copy is handed the
+  // parameters rather than left to retype them off a screen.
+  const copy = Array.from(doc.querySelectorAll("#xButtons button"))
+    .find((b) => b.textContent === "copy the details");
+  if (copy) {
+    copy.click();
+    await wait(100);
+    const offered = doc.getElementById("xPasteInput").value;
+    record("the details are offered as copyable text", offered.includes("mode=offer") &&
+      offered.includes("npub1"), offered);
+  } else {
+    record("the details are offered as copyable text", false, "no control to offer them");
+  }
+
+  // Nothing has been chosen, so nothing has been consumed: a visitor
+  // who takes the details elsewhere must still have them.
+  record("the pairing is still in the address",
+    win.location.hash.includes("mode=offer"), win.location.hash);
+
+  const summary = document.getElementById("summary");
+  summary.textContent = pass + " passed, " + fail + " failed";
+  summary.className = fail === 0 ? "ok" : "bad";
+})().catch((err) => {
+  const summary = document.getElementById("summary");
+  summary.textContent = "the check could not be run: " + err.message;
+  summary.className = "bad";
+});
+</script>
+</body>
+</html>

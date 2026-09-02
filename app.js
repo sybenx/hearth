@@ -5126,6 +5126,67 @@ xCloseBtn.addEventListener("click", closeTransfer);
 
 /* ---------- starting one ---------- */
 
+/* ---------- the bounce page (qrst §11.2a) ----------
+
+   The code carries an https link, so a phone's own camera app opens
+   a browser at whichever copy of Hearth drew it. That copy is very
+   often not the one the visitor keeps their key in — every bothy
+   serves a copy, and the canonical one serves another — so this page
+   does not assume the pairing is its business. It reads its own
+   fragment, offers to carry on here, and otherwise hands over the
+   details for the visitor to take to the app they actually use.
+
+   Nothing happens on the network until they choose. That is the
+   whole point of the section: the fragment never reaches a server,
+   so the host learns nothing from the visit, and a page that quietly
+   started connecting to things would be reintroducing the operator
+   the design exists to avoid. Hearth's own boot — the group relay,
+   the NIP-11 read, the version check — waits behind this. bounce.html
+   is the check that it does.
+
+   A pairing that arrived this way is never treated as read by this
+   device's camera, whichever app handed the fragment over: §12.1's
+   extra friction applies to it and §9.1 fails closed on it. */
+function showBounce(pairing, onContinue) {
+  accountOverlayEl.hidden = true;
+  xferEl.hidden = false;
+  xShow(xMultiEl, false);
+  // Closing the panel is a third answer and a real one: this is not
+  // my copy and I am not taking the details either. It puts the
+  // pairing down — otherwise the screen behind would open the
+  // transfer the ✕ just declined — and lets Hearth start.
+  xferOnClose = () => { consumePairing(); onContinue(); };
+  const details = () => {
+    xPasteInput.value = location.href;
+    xShow(xPasteRowEl, true);
+    xShow(xPasteGoBtn, false);
+    xPasteInput.select();
+    xPromptEl.textContent = "Copy this into the app you keep your key in.";
+    xShow(xPromptEl, true);
+  };
+  xRender({
+    title: "a device is asking to pair",
+    note: pairing.error
+      ? "Another device sent you here, but its code couldn't be read: " + pairing.error
+      : "Another device drew a code and this is where it points. Carry on here if this is " +
+        "the copy of Hearth you use, and take the details elsewhere if it isn't.",
+    buttons: pairing.error
+      ? [{ label: "close", onClick: () => { consumePairing(); closeBounce(onContinue); } }]
+      : [
+          { label: "carry on here", onClick: () => closeBounce(onContinue) },
+          { label: "copy the details", quiet: true, onClick: details },
+        ],
+  });
+}
+
+function closeBounce(onContinue) {
+  xShow(xPasteRowEl, false);
+  xShow(xPasteGoBtn, true);
+  xferOnClose = null;
+  xferEl.hidden = true;
+  onContinue();
+}
+
 /* ---------- arriving on a pairing link ----------
 
    The other device's code sent this browser here with a pairing URI
@@ -5958,6 +6019,13 @@ function start(relayUrl) {
 }
 
 (async function init() {
+  // §11.2a, and it is the first thing because it has to be. A visitor
+  // who has not said this is their copy of Hearth is owed a page that
+  // has done nothing: no relay, no NIP-11, no version check, nothing
+  // that would tell anybody they were here. Everything below waits.
+  const arriving = pendingPairing();
+  if (arriving) await new Promise((resolve) => showBounce(arriving, resolve));
+
   try {
     identity = await acquireIdentity();
   } catch (err) {
