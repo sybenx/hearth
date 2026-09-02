@@ -125,8 +125,10 @@ QR Secret Transfer, which lives in the nostr-key-management repository along wit
 `nostr-nsec` profile naming what Hearth moves under it. `keyxfer.js` implements it and
 knows nothing about Hearth, `keyxfer-vectors.json` holds the known answers a second
 implementation has to reproduce, and `vectors.html` checks them. Its event kinds are
-unregistered placeholders in the specification too, so a build of Hearth pairs with a build
-of Hearth and with nothing else until they are settled.
+provisional rather than arbitrary: they sit in the ephemeral range and were checked free of
+collision, but no NIP has reserved them yet, so a build of Hearth pairs with a build of
+Hearth and with nothing else until one does. They change only if that process asks, which
+is not the same as expecting them to churn.
 
 ## What is private and what is not
 

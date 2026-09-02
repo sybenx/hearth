@@ -59,10 +59,13 @@ const DEFAULT_RELAYS = [
   "wss://offchain.pub",
 ];
 
-// qrst §11.4. Placeholders in the specification too: they are not
-// registered anywhere and are expected to change once they are, so
-// a build of hearth pairs with a build of hearth and nothing else
-// until that happens.
+// qrst §11.4. Provisional rather than arbitrary: they sit in the
+// ephemeral range, where relays never store them and one leaked
+// unwrapped is dropped rather than kept, and they were checked free
+// of collision against the registered kinds. What they are not yet
+// is reserved by a NIP, so interoperability is not promised until
+// that happens — but they change only if that process asks, which is
+// a different thing from expecting churn.
 const KINDS = {
   SEAL: 13,           // NIP-59
   GIFT_WRAP: 1059,    // NIP-59
@@ -92,7 +95,6 @@ const VERSION = "1";              // the QR's v= (§11.2)
 const VERSION_BYTE = 1;
 const SESSION_SECONDS = 600;      // §2, a session lives ten minutes
 const WRAP_EXPIRY_SECONDS = 600;  // §11.4
-const SINCE_BACKDATE = 172800;    // §11.5, two days
 const ZEROIZE_AFTER_MS = 60000;   // §7 step 18, §8 step 18
 const MAX_PENDING = 5;            // §8, pending requests per session
 const SAS_LIST_MAX = 3;           // §9, codes shown at once
@@ -268,16 +270,6 @@ function newBurner() {
   return { priv, pub: toHex(S.schnorr.getPublicKey(priv)) };
 }
 
-// NIP-59 asks for a timestamp somewhere in the last two days so
-// that the moment a wrap was made is not written on the outside of
-// it. It is also the reason for two other rules in this file: the
-// expiration below is computed from the real clock rather than
-// from this, and a subscription has to reach two days back or it
-// sees nothing.
-function randomizedCreatedAt() {
-  return nowSeconds() - Math.floor(Math.random() * SINCE_BACKDATE);
-}
-
 /* ---------- NIP-59: rumor, seal, wrap ---------- */
 
 // The rumor is the message itself and is never signed: an unsigned
@@ -295,23 +287,28 @@ async function makeRumor(senderPub, kind, tags, content) {
   return rumor;
 }
 
+// §11.4: the true clock, contrary to NIP-59. The randomisation
+// exists to hide when a message was written from somebody reading it
+// later; here every wrap is published the instant it is made, both
+// ends are burners that exist for one session, and it hides nothing
+// while costing two things — a subscription that has to reach two
+// days back to see anything, and a second timestamp to reason about
+// beside the one the expiry is actually enforced against.
 async function wrapRumor(rumor, senderPriv, recipientPubHex) {
   const seal = await signWith(senderPriv, {
     kind: KINDS.SEAL,
-    created_at: randomizedCreatedAt(),
     tags: [],
     content: nip44Encrypt(JSON.stringify(rumor), conversationKey(senderPriv, recipientPubHex)),
   });
   const onetime = S.utils.randomPrivateKey();
   const wrap = await signWith(onetime, {
     kind: KINDS.GIFT_WRAP,
-    created_at: randomizedCreatedAt(),
     tags: [
       ["p", recipientPubHex],
-      // Wall-clock now plus ten minutes, and deliberately not the
-      // wrap's own created_at, which the line above may have put
-      // two days in the past. A relay reading NIP-40 off that
-      // would drop the wrap before it was ever delivered.
+      // Advisory, and §11.4 says so: a relay may honour it, ignore
+      // it, or serve the event long after it has lapsed. What
+      // actually enforces the window is the rumor's own timestamp,
+      // which is the one the seal signature covers.
       ["expiration", String(nowSeconds() + WRAP_EXPIRY_SECONDS)],
     ],
     content: nip44Encrypt(JSON.stringify(seal), conversationKey(onetime, recipientPubHex)),
@@ -320,10 +317,12 @@ async function wrapRumor(rumor, senderPriv, recipientPubHex) {
   return wrap;
 }
 
-// Returns the rumor and the key that sealed it, because the two
-// have to be compared: a rumor names its own burner in a tag, and
-// a rumor whose tag disagrees with the key that sealed it is
-// somebody replaying somebody else's message under their own seal.
+// Returns the rumor and the key that sealed it, because the two have
+// to be compared. §11.4: the rumor's own pubkey field is the sending
+// burner and must equal the key that signed the seal. That is the
+// whole of attribution — the sending burner appears in no other
+// field — and a rumor failing it is somebody replaying somebody
+// else's message under their own seal.
 async function unwrap(wrapEvent, recipientPriv) {
   const sealJson = nip44Decrypt(wrapEvent.content, conversationKey(recipientPriv, wrapEvent.pubkey));
   const seal = JSON.parse(sealJson);
@@ -562,7 +561,7 @@ function displayOrigin(origin) {
    burner and all of them published to. A relay that refuses the
    publish is simply one that did not carry it; the others did.
    ============================================================ */
-function relayPool(urls, burner, onEvent, onHealth) {
+function relayPool(urls, burner, since, onEvent, onHealth) {
   const sockets = new Map();
   const seen = new Set();
   // Everything this session has published, kept so that a relay
@@ -616,11 +615,11 @@ function relayPool(urls, burner, onEvent, onHealth) {
     ws.send(JSON.stringify(["REQ", "kx", {
       kinds: [KINDS.GIFT_WRAP],
       "#p": [burner.pub],
-      // Two days back, because a wrap's created_at is randomised
-      // that far into the past. A subscription starting now is a
-      // subscription that receives nothing and looks like a
-      // relay that has stopped answering.
-      since: nowSeconds() - SINCE_BACKDATE,
+      // §11.5: the session's start, less the clock slack. It used to
+      // reach two days back, which was the cost of a randomised wrap
+      // timestamp; the wrap carries the true clock now, so the
+      // window is the session and nothing more.
+      since,
     }]));
   }
 
@@ -917,7 +916,11 @@ function startSession(opts) {
   // case for the first message of a session: it is composed the
   // moment the QR is scanned, and the sockets are still opening.
   async function send(kind, tags, content, toPubHex) {
-    const rumor = await makeRumor(burner.pub, kind, tags.concat([["v", VERSION]]), content);
+    // No version tag: §11.4 says messages carry none. The session's
+    // version is fixed by the QR and hashed into the commit and the
+    // code, so a peer speaking a different one cannot agree on a
+    // number with this device and never gets as far as a message.
+    const rumor = await makeRumor(burner.pub, kind, tags, content);
     const wrap = await wrapRumor(rumor, burner.priv, toPubHex);
     return pool ? pool.publish(wrap) : 0;
   }
@@ -929,7 +932,7 @@ function startSession(opts) {
   // the session has to wait for this rather than closing the
   // sockets out from under it.
   function abortTo(peerHex) {
-    return send(KINDS.ABORT, [["burner", burner.pub]], "", peerHex).catch(() => 0);
+    return send(KINDS.ABORT, [], "", peerHex).catch(() => 0);
   }
 
   // The same, for the callers that end the session immediately
@@ -945,15 +948,19 @@ function startSession(opts) {
   // Everything a rumor has to satisfy before it is looked at as a
   // message rather than as bytes somebody sent.
   function admissible(rumor, sealSigner) {
-    // §11.4: all three of the rumor's own pubkey, the burner it
-    // names in a tag and the key that sealed it are one key, or
-    // somebody is forwarding a message that was not theirs.
-    if (tagValue(rumor.tags, "burner") !== sealSigner) return false;
+    // §11.4's attribution check, and the whole of it: the rumor's own
+    // pubkey is the sending burner and must be the key that signed
+    // the seal, or somebody is forwarding a message that was not
+    // theirs. Hearth used to require a `burner` tag saying the same
+    // thing a third time. Reserved tag names are `commit` and
+    // `nonce`; no other client sends a third, so requiring one meant
+    // discarding every message any of them ever sent.
     if (rumor.pubkey !== sealSigner) return false;
-    // §13: a rumor whose own created_at is outside this session
-    // is discarded here and not anywhere later, so that a
-    // backdated timestamp cannot buy its sender a quiet arrival
-    // that skips the notice above.
+    // §11.4: a rumor whose own created_at is outside this session is
+    // discarded from the session entirely — here and not anywhere
+    // later, so that a backdated timestamp cannot buy its sender a
+    // quiet arrival that skips the notice above, and so that it is
+    // never a candidate rather than merely uncounted.
     const at = rumor.created_at;
     if (typeof at !== "number") return false;
     if (at < startedAt - CLOCK_SLACK) return false;
@@ -1003,7 +1010,7 @@ function startSession(opts) {
       peer.commit = commit;
       peer.nonce = S.utils.randomBytes(32);
       noteResponder();
-      await send(KINDS.NONCE, [["burner", burner.pub], ["nonce", toHex(peer.nonce)]], "", from);
+      await send(KINDS.NONCE, [["nonce", toHex(peer.nonce)]], "", from);
       return;
     }
 
@@ -1015,7 +1022,7 @@ function startSession(opts) {
       const nonce = tagValue(rumor.tags, "nonce");
       if (!nonce || nonce.length !== 64) return;
       peer.theirNonce = fromHex(nonce);
-      await send(KINDS.REVEAL, [["burner", burner.pub], ["nonce", toHex(ownNonce)]], "", from);
+      await send(KINDS.REVEAL, [["nonce", toHex(ownNonce)]], "", from);
       await settleSas(peer);
       return;
     }
@@ -1232,8 +1239,7 @@ function startSession(opts) {
       // no arrangement of buttons can get past it.
       if (!peer.verified) return;
       peer.sent = true;
-      await send(KINDS.PAYLOAD,
-        [["burner", burner.pub], ["lock", lock || "device"]], privkeyHex, peerHex);
+      await send(KINDS.PAYLOAD, [["lock", lock || "device"]], privkeyHex, peerHex);
       emit("sent", { peer: peerHex, sas: peer.sas });
       // §7 step 18 and §8 step 18: the burner goes when the other
       // device says it has the key, or a minute later regardless.
@@ -1292,7 +1298,7 @@ function startSession(opts) {
         peer: peerHex,
         multi: multiSeen,
       };
-      await send(KINDS.ACK, [["burner", burner.pub]], "", peerHex);
+      await send(KINDS.ACK, [], "", peerHex);
       // A moment for the acknowledgement to reach a relay before
       // the sockets are closed under it; the holder's own minute
       // covers it either way.
@@ -1304,13 +1310,9 @@ function startSession(opts) {
     // talking to. Same seal, same wrap, same session; this file does
     // not look inside it.
     //
-    // The burner tag is added here rather than asked of the caller.
-    // Every rumor carries it and the far side discards any that does
-    // not, so leaving it to a caller that has no reason to know the
-    // rule would be a message that vanishes with no error anywhere.
     async sendTo(peerHex, kind, tags, content) {
       if (!peers.has(peerHex) || finished) return 0;
-      return await send(kind, [["burner", burner.pub]].concat(tags || []), content, peerHex);
+      return await send(kind, tags || [], content, peerHex);
     },
 
     cancel() { stop("cancelled"); },
@@ -1341,7 +1343,7 @@ function startSession(opts) {
   // Getting started: a burner, a subscription, and either a QR to
   // draw or a first message to send.
   (async function begin() {
-    pool = relayPool(relays, burner, onWrap, (health) => {
+    pool = relayPool(relays, burner, startedAt - CLOCK_SLACK, onWrap, (health) => {
       if (health.live > 0 && !everLive) {
         everLive = true;
         emit("connected", health);
@@ -1392,7 +1394,7 @@ function startSession(opts) {
     // so has no such key, and a tag naming a key that does not
     // exist would be worse than an absent one.
     peerFor(scanned.burner);
-    await send(kind, [["burner", burner.pub], ["commit", ownCommit]], "", scanned.burner);
+    await send(kind, [["commit", ownCommit]], "", scanned.burner);
     emit("sent-hello");
   })();
 

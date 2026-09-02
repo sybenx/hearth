@@ -116,17 +116,20 @@ function eq(name, got, want) {
   eq("the seal names the key that signed it", opened.sealSigner, w.holder_pubkey);
 
   // Not a known answer: a fresh wrap is different every time. What is
-  // fixed is that its expiration comes from the clock rather than from
-  // its own created_at, which NIP-59 puts up to two days in the past.
-  const rumor = await K.makeRumor(w.holder_pubkey, K.KINDS.PAYLOAD,
-    [["burner", w.holder_pubkey]], "");
+  // fixed is §11.4's timestamps — the wrap carries the true clock
+  // rather than NIP-59's randomised past value, and the rumor inside
+  // it carries the timestamp the session window is actually enforced
+  // against.
+  const rumor = await K.makeRumor(w.holder_pubkey, K.KINDS.PAYLOAD, [], "");
   const fresh = await K.wrapRumor(rumor, K.fromHex(n.holder_privkey), w.joiner_pubkey);
   const expiration = Number(fresh.tags.find((t) => t[0] === "expiration")[1]);
   const now = Math.floor(Date.now() / 1000);
   record("the wrap expires ten minutes from now", Math.abs(expiration - (now + 600)) <= 2,
     "expiration " + expiration + ", now " + now);
-  record("the expiration was not computed from the wrap's own created_at",
-    expiration - fresh.created_at !== 600);
+  record("the wrap is stamped with the true clock, not a randomised past one",
+    Math.abs(fresh.created_at - now) <= 2, "created_at " + fresh.created_at + ", now " + now);
+  record("the rumor inside it is stamped with the true clock too",
+    Math.abs(rumor.created_at - now) <= 2);
   const round = await K.unwrap(fresh, K.fromHex(w.joiner_privkey));
   eq("a fresh wrap round trips", round.rumor.id, rumor.id);
 
