@@ -83,7 +83,13 @@ const KNOWN_KINDS = new Set([
   KINDS.ACK, KINDS.NONCE, KINDS.REVEAL, KINDS.ABORT,
 ]);
 
-const VERSION = "1";              // the `v` tag and the QR's v=
+const VERSION = "1";              // the QR's v= (§11.2)
+// The same number as a single byte, which is what §6 hashes. It is a
+// field in the transcript rather than a suffix on the label because a
+// suffix is a string two implementations can spell differently; a byte
+// is not. A future version changes every digit derived here without
+// anybody having to agree about punctuation.
+const VERSION_BYTE = 1;
 const SESSION_SECONDS = 600;      // §2, a session lives ten minutes
 const WRAP_EXPIRY_SECONDS = 600;  // §11.4
 const SINCE_BACKDATE = 172800;    // §11.5, two days
@@ -376,26 +382,30 @@ function tagValue(tags, name) {
    ============================================================ */
 async function sasCommit(contactingPubHex, nonce) {
   return toHex(await S.utils.sha256(concat(
-    enc.encode("qrst-commit-v1"), fromHex(contactingPubHex), nonce)));
+    enc.encode("qrst-commit"), new Uint8Array([VERSION_BYTE]),
+    fromHex(contactingPubHex), nonce)));
 }
 
-// The order is the two roles, holder first, and never the order
-// the two messages happened to arrive in. The contacting device
-// is the holder in flow A and the joiner in flow B, so a version
-// of this that hashed "me then them" would agree with itself and
-// with nothing else.
+// The order is the two roles — the party releasing the secret
+// first, the party obtaining it second — and never the order the
+// two messages happened to arrive in. The device that made contact
+// is the releasing one in flow A and the obtaining one in flow B,
+// so a version of this that hashed "me then them" would agree with
+// itself and with nothing else. The vectors carry the transposed
+// answer for exactly that reason.
 //
-// The profile goes in first, length-prefixed, so that two devices
-// which disagree about what kind of secret is moving cannot arrive
-// at the same number — the agreement about that is part of what
-// the person checks rather than something checked afterwards.
-async function sasCode(holderPubHex, joinerPubHex, nonceHolder, nonceJoiner) {
+// The version byte and then the profile, length-prefixed, so that
+// two devices which disagree about which version they are speaking
+// or what kind of secret is moving cannot arrive at the same
+// number — the agreement about both is part of what the person
+// checks rather than something checked afterwards.
+async function sasCode(senderPubHex, receiverPubHex, nonceSender, nonceReceiver) {
   const profile = enc.encode(PROFILE);
   const code = await S.utils.sha256(concat(
-    enc.encode("qrst-sas-v1"),
+    enc.encode("qrst-sas"), new Uint8Array([VERSION_BYTE]),
     new Uint8Array([profile.length]), profile,
-    fromHex(holderPubHex), fromHex(joinerPubHex),
-    nonceHolder, nonceJoiner));
+    fromHex(senderPubHex), fromHex(receiverPubHex),
+    nonceSender, nonceReceiver));
   // Five bytes rather than four, so that reducing them to five
   // digits leaves a bias too small to be worth a sentence.
   const n = code[0] * 4294967296 + (((code[1] << 24) | (code[2] << 16) |
