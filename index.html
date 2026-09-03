@@ -734,6 +734,23 @@ input{font:inherit;color:inherit;background:none;border:none}
 .npFail{font-size:12.5px;line-height:1.5;color:var(--live)}
 
 /* the transfer screen: one thing at a time, over the call view */
+/* A question that has to be answered before something touching the
+   key happens (NKM §2.2). Its own layer rather than the transfer
+   panel's, because it is asked from places that have nothing to do
+   with a transfer, and it sits above everything including that. */
+.ask{
+  position:fixed;inset:0;z-index:80;background:rgba(6,4,3,.82);
+  display:flex;align-items:center;justify-content:center;padding:22px;
+}
+.askPanel{
+  width:100%;max-width:330px;background:var(--raise);border:1px solid var(--line2);
+  border-radius:16px;padding:20px 18px;display:flex;flex-direction:column;gap:12px;
+  text-align:center;
+}
+.askTitle{font:600 15px/1.3 var(--sans)}
+.askNote{font-size:13px;line-height:1.55;color:var(--dim);margin:0;white-space:pre-line}
+.askHint{font-size:12px;line-height:1.5;color:var(--faint);margin:0}
+.askPanel .choiceRow{justify-content:center}
 .xfer{
   position:fixed;inset:0;z-index:60;background:var(--stage);
   display:flex;align-items:center;justify-content:center;overflow-y:auto;
@@ -1136,6 +1153,13 @@ input{font:inherit;color:inherit;background:none;border:none}
       <div class="relayList" id="aoTransfers"></div>
     </div>
 
+    <div class="sect" id="aoGuardSect" hidden>
+      <div class="lbl">ask before anything touches your key</div>
+      <div class="secNote" id="aoGuardNote"></div>
+      <button class="pillBtn" id="aoGuardBtn"></button>
+      <p class="panelFail" id="aoGuardFail" hidden></p>
+    </div>
+
     <div class="sect">
       <div class="lbl">bring your own identity</div>
       <div class="secNote">Already have a nostr identity? Bring it with you. Whatever you bring
@@ -1185,6 +1209,15 @@ input{font:inherit;color:inherit;background:none;border:none}
 </div>
 
 <video id="liveVideo" class="liveVideo" playsinline autoplay muted hidden></video>
+
+<div class="ask" id="ask" hidden>
+  <div class="askPanel">
+    <div class="askTitle" id="askTitle"></div>
+    <p class="askNote" id="askNote"></p>
+    <p class="askHint" id="askHint" hidden></p>
+    <div class="choiceRow" id="askButtons"></div>
+  </div>
+</div>
 
 <div class="xfer" id="xfer" hidden>
   <div class="hearthGlow"></div>

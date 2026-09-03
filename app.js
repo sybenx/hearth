@@ -32,6 +32,15 @@ const stageEl = document.getElementById("stage");
 const mainEl = document.getElementById("main");
 const pillSlotEl = document.getElementById("pillSlot");
 const tbNameEl = document.getElementById("tbName");
+const aoGuardSectEl = document.getElementById("aoGuardSect");
+const aoGuardNoteEl = document.getElementById("aoGuardNote");
+const aoGuardBtn = document.getElementById("aoGuardBtn");
+const aoGuardFailEl = document.getElementById("aoGuardFail");
+const askEl = document.getElementById("ask");
+const askTitleEl = document.getElementById("askTitle");
+const askNoteEl = document.getElementById("askNote");
+const askHintEl = document.getElementById("askHint");
+const askButtonsEl = document.getElementById("askButtons");
 const tbStatusEl = document.getElementById("tbStatus");
 const vpNameEl = document.getElementById("vpName");
 const vpStatusEl = document.getElementById("vpStatus");
@@ -701,6 +710,216 @@ function nameScreen(alreadySignedIn) {
     landingDeviceBtn.addEventListener("click", fromOtherDevice);
   });
 }
+
+/* ------------------------------------------------------------
+   what may only happen with the person present (NKM §2.2, §2.3)
+
+   The rule is not about how dangerous something feels. An action is
+   privileged if and only if it touches the key itself — who holds it,
+   where a copy goes, or what protects it. Posting, reading, joining a
+   call and every signature a page asks for are never privileged,
+   however much they matter, because none of them changes who can be
+   this person tomorrow.
+
+   In a browser the gate is a passkey: a platform authenticator, user
+   verification required, and a fresh assertion for each act. §2.3 is
+   candid that this is a consent step and not a wall — the key is
+   decrypted by a wrapping key any script on this address can use, so
+   a hostile script is not stopped by it. What it stops is the quiet
+   version: a page that acts without the person, and a person who
+   cannot tell which of their taps was the one that gave a key away.
+   It is also the only thing standing behind the deviation in
+   CLAUDE.md, which is why it is wired before anything that relies on
+   it rather than after.
+
+   Where the platform has no authenticator the specification says to
+   proceed: §2.2 substitutes the OS credential prompt "where one
+   exists and otherwise proceed[s]", and a device with none still has
+   to be able to move its own key. Hearth's own confirmation is what
+   is left, and the account screen says so rather than implying a
+   protection that is not there.
+
+   The two salts are stored now and used later. The first is this
+   gate. The second is what §4.2 derives a backup key from, and
+   asking for a second passkey at that point would be asking the
+   person to enrol twice for one thing.
+   ------------------------------------------------------------ */
+const PASSKEY_KEY = "hearth:passkey";
+const PASSKEY_TIMEOUT_MS = 60000;
+
+function b64url(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function unb64url(text) {
+  const s = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+// Ids and salts. Nothing here is a secret and nothing here opens
+// anything on its own, which is why localStorage is the right place
+// for it and the key itself is not there.
+function storedPasskey() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PASSKEY_KEY) || "null");
+    return raw && typeof raw.id === "string" ? raw : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function platformAuthenticator() {
+  if (!window.PublicKeyCredential ||
+      !PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) return false;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch (err) {
+    return false;
+  }
+}
+
+/* §2.3, and the attachment is required rather than cosmetic: without
+   it the credential may land on a roaming key or a device-bound
+   authenticator, and §4.2 recovery is the case where this device is
+   gone. A resident key so it can be found without being told which
+   one, and user verification because an assertion nobody had to
+   answer is not a prompt. */
+async function enrolPasskey() {
+  const saltA = crypto.getRandomValues(new Uint8Array(32));
+  const saltB = crypto.getRandomValues(new Uint8Array(32));
+  const created = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: "Hearth", id: location.hostname },
+      user: {
+        id: identity ? S.utils.hexToBytes(identity.pubkey) : crypto.getRandomValues(new Uint8Array(32)),
+        name: identity ? shortName(identity.pubkey) : "hearth",
+        displayName: identity ? shortName(identity.pubkey) : "hearth",
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform",
+        residentKey: "required",
+        userVerification: "required",
+      },
+      extensions: { prf: { eval: { first: saltA, second: saltB } } },
+      timeout: PASSKEY_TIMEOUT_MS,
+    },
+  });
+  if (!created) throw new Error("that didn't finish");
+  // §2.3: PRF on create is recent, so its absence here says nothing
+  // about whether the authenticator supports it. What settles that is
+  // an assertion, and §4.2 is what needs the answer, so it is written
+  // down as unknown rather than guessed at.
+  let prf = null;
+  try {
+    const ext = created.getClientExtensionResults();
+    if (ext && ext.prf && ext.prf.results) prf = true;
+    else if (ext && ext.prf && ext.prf.enabled === false) prf = false;
+  } catch (err) {
+    // An authenticator that will not say. Unknown, as above.
+  }
+  localStorage.setItem(PASSKEY_KEY, JSON.stringify({
+    id: b64url(new Uint8Array(created.rawId)),
+    saltA: b64url(saltA),
+    saltB: b64url(saltB),
+    prf,
+  }));
+  return true;
+}
+
+// A fresh assertion, every time. §9.1 of the transfer specification
+// says the same thing about its own consent and for the same reason:
+// an answer that is remembered is an answer somebody else can use.
+async function assertPasskey() {
+  const stored = storedPasskey();
+  if (!stored) return false;
+  const got = await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{ type: "public-key", id: unb64url(stored.id) }],
+      userVerification: "required",
+      timeout: PASSKEY_TIMEOUT_MS,
+    },
+  });
+  return !!got;
+}
+
+/* One question, two answers, and nothing else on the screen while it
+   is up. Resolves true for yes and false for everything else — a
+   cancel, a dismissal and an error are the same answer, which is no.
+
+   Its own overlay rather than the transfer panel's, because it is
+   asked from places that have nothing to do with a transfer. */
+function ask(opts) {
+  return new Promise((resolve) => {
+    askTitleEl.textContent = opts.title || "";
+    askNoteEl.textContent = opts.note || "";
+    askHintEl.textContent = opts.hint || "";
+    askHintEl.hidden = !opts.hint;
+    askButtonsEl.innerHTML = "";
+    let done = false;
+    const finish = (answer) => {
+      if (done) return;
+      done = true;
+      askEl.hidden = true;
+      resolve(answer);
+    };
+    // The affirmative is the quiet one, for the same reason the
+    // transfer's release control is: somebody moving quickly should
+    // land on not doing it.
+    for (const [label, quiet, answer] of [
+      [opts.no || "cancel", false, false],
+      [opts.yes || "go ahead", true, true],
+    ]) {
+      const btn = document.createElement("button");
+      btn.textContent = label;
+      if (quiet) btn.className = "quiet";
+      btn.addEventListener("click", () => finish(answer));
+      askButtonsEl.appendChild(btn);
+    }
+    askEl.hidden = false;
+  });
+}
+
+/* The gate itself. `what` is one line naming what it guards, because
+   §2.2 is explicit that a prompt the person cannot attribute to
+   something they just did is a defect — so it is passed in by the
+   caller that knows, never composed here out of a verb.
+
+   Returns true to go ahead. False is a refusal and the caller stops. */
+async function privileged(what) {
+  if (storedPasskey()) {
+    try {
+      return await assertPasskey();
+    } catch (err) {
+      // Cancelled at the platform prompt, or an authenticator that
+      // would not answer. Both are no.
+      return false;
+    }
+  }
+  // Nothing enrolled, so hearth's own confirmation is the prompt.
+  // §2.2 substitutes the OS credential prompt "where one exists and
+  // otherwise proceed[s]", and a device whose owner has not enrolled
+  // one still has to be able to move its own key. Where the platform
+  // could do better, the screen says so instead of hearth quietly
+  // being the weaker thing.
+  const couldBeBetter = await platformAuthenticator();
+  return await ask({
+    title: "before this happens",
+    note: what,
+    hint: couldBeBetter
+      ? "This device could ask for your fingerprint or face first. Turn that on under your account."
+      : null,
+    yes: "go ahead",
+    no: "cancel",
+  });
+}
+
 
 /* ------------------------------------------------------------
    DEV ONLY. This relay gates group membership by hand — every
@@ -1627,7 +1846,57 @@ function renderAccountChrome() {
       "device, sealed so that this page can use it but never read it out. The one way it " +
       "leaves is a transfer you start yourself and confirm on both devices.";
   aoExtBtn.hidden = !(hasExtension() && identity.kind !== "extension");
+  renderGuard();
 }
+
+/* NKM §2.2 and §2.3, said in the account screen because that is where
+   everything about the key lives. An extension identity is left out:
+   the key is not here to guard, and the extension does its own asking.
+
+   The section appears only where the platform actually has an
+   authenticator. Offering it where there is none would be offering
+   something that cannot be turned on, and the honest thing to say
+   about such a device is nothing rather than an explanation of what
+   it is missing. */
+async function renderGuard() {
+  aoGuardSectEl.hidden = true;
+  if (!identity || identity.kind === "extension") return;
+  const enrolled = !!storedPasskey();
+  if (!enrolled && !(await platformAuthenticator())) return;
+  aoGuardSectEl.hidden = false;
+  xShow(aoGuardFailEl, false);
+  aoGuardNoteEl.textContent = enrolled
+    ? "Hearth asks for your fingerprint or face before anything that touches your key: " +
+      "sending it to another device, exporting it, or changing what protects it. Not " +
+      "before posting, reading or joining a call, which never touch it."
+    : "This device can ask for your fingerprint or face before anything that touches your " +
+      "key: sending it to another device, exporting it, or changing what protects it. " +
+      "It cannot stop a page on this address reading what it stores, and Hearth does not " +
+      "claim otherwise; what it stops is any of that happening without you.";
+  aoGuardBtn.textContent = enrolled ? "turn it off" : "turn it on";
+}
+
+aoGuardBtn.addEventListener("click", async () => {
+  xShow(aoGuardFailEl, false);
+  if (storedPasskey()) {
+    // Removing the guard is itself a thing that changes what protects
+    // the key, so it is behind the guard (§2.2).
+    if (!(await privileged("This stops Hearth asking for your fingerprint or face before " +
+        "anything that touches your key."))) {
+      return;
+    }
+    localStorage.removeItem(PASSKEY_KEY);
+    renderGuard();
+    return;
+  }
+  try {
+    await enrolPasskey();
+  } catch (err) {
+    aoGuardFailEl.textContent = "That didn't finish: " + (err.message || "no reason given");
+    xShow(aoGuardFailEl, true);
+  }
+  renderGuard();
+});
 
 /* ============================================================
    rendering
@@ -5799,6 +6068,16 @@ const RELAY_TAG = "relay";
 const RELAYS_SENT_MAX = 8;
 
 async function sendKey(data) {
+  // NKM §2.2: acting as Sender is privileged, so the person is asked
+  // once more with the platform's own prompt. Complementary to the
+  // code and never instead of it — qrst §9.2 is explicit that a
+  // biometric tap must not stand in for typing the five figures, and
+  // by here they have already been typed.
+  const to = data.origin ? "a browser at " + data.origin : "that device";
+  if (!(await privileged("This sends your key to " + to + ", and whoever holds it is you " +
+      "from then on."))) {
+    return;
+  }
   xRender({ title: "add a device", sas: data.sas, waiting: "sending" });
   const relays = rememberedRelays().slice(0, RELAYS_SENT_MAX);
   await xfer.approve(data.peer, S.utils.bytesToHex(identity.privkey), {
