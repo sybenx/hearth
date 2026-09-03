@@ -738,6 +738,17 @@ input{font:inherit;color:inherit;background:none;border:none}
    key happens (NKM §2.2). Its own layer rather than the transfer
    panel's, because it is asked from places that have nothing to do
    with a transfer, and it sits above everything including that. */
+/* The backup, once it exists: a code that can be photographed or
+   printed, and the same thing as text for a clipboard. */
+.backupOut{display:flex;flex-direction:column;gap:10px;margin-top:12px;align-items:center}
+.backupOut canvas{
+  width:100%;max-width:230px;height:auto;background:var(--ink);
+  padding:8px;border-radius:10px;image-rendering:pixelated;
+}
+.backupOut code{
+  width:100%;font:11px/1.5 var(--mono);color:var(--dim);word-break:break-all;
+  background:var(--raise2);border:1px solid var(--line2);border-radius:10px;padding:8px 10px;
+}
 .ask{
   position:fixed;inset:0;z-index:80;background:rgba(6,4,3,.82);
   display:flex;align-items:center;justify-content:center;padding:22px;
@@ -1151,6 +1162,34 @@ input{font:inherit;color:inherit;background:none;border:none}
         <button class="pillBtn" id="aoAllowSend"></button>
       </div>
       <div class="relayList" id="aoTransfers"></div>
+    </div>
+
+    <div class="sect" id="aoBackupSect">
+      <div class="lbl">back up your key</div>
+      <div class="secNote">A file you keep, holding this identity sealed with a passphrase you
+        choose. It is the only way back if every device you have is lost, and Hearth cannot
+        open it for you or remind you of the passphrase.</div>
+      <div class="importRow">
+        <input id="aoBackupPass" type="password" autocomplete="new-password" spellcheck="false"
+          placeholder="a passphrase for the backup">
+      </div>
+      <div class="importRow">
+        <input id="aoBackupPass2" type="password" autocomplete="new-password" spellcheck="false"
+          placeholder="the same passphrase again">
+      </div>
+      <button class="pillBtn" id="aoBackupBtn">make a backup</button>
+      <p class="panelFail" id="aoBackupFail" hidden></p>
+      <div class="backupOut" id="aoBackupOut" hidden>
+        <div class="secNote">Anyone who has this file can try passwords against it for as long
+          as they like, so the passphrase is the whole of what protects it. Keep it somewhere
+          only you reach.</div>
+        <canvas id="aoBackupQr"></canvas>
+        <code id="aoBackupText"></code>
+        <div class="choiceRow">
+          <button id="aoBackupSave">save the file</button>
+          <button id="aoBackupDone" class="quiet">done</button>
+        </div>
+      </div>
     </div>
 
     <div class="sect" id="aoGuardSect" hidden>

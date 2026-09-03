@@ -32,6 +32,16 @@ const stageEl = document.getElementById("stage");
 const mainEl = document.getElementById("main");
 const pillSlotEl = document.getElementById("pillSlot");
 const tbNameEl = document.getElementById("tbName");
+const aoBackupSectEl = document.getElementById("aoBackupSect");
+const aoBackupPassEl = document.getElementById("aoBackupPass");
+const aoBackupPass2El = document.getElementById("aoBackupPass2");
+const aoBackupBtn = document.getElementById("aoBackupBtn");
+const aoBackupFailEl = document.getElementById("aoBackupFail");
+const aoBackupOutEl = document.getElementById("aoBackupOut");
+const aoBackupQrEl = document.getElementById("aoBackupQr");
+const aoBackupTextEl = document.getElementById("aoBackupText");
+const aoBackupSaveBtn = document.getElementById("aoBackupSave");
+const aoBackupDoneBtn = document.getElementById("aoBackupDone");
 const aoGuardSectEl = document.getElementById("aoGuardSect");
 const aoGuardNoteEl = document.getElementById("aoGuardNote");
 const aoGuardBtn = document.getElementById("aoGuardBtn");
@@ -1013,13 +1023,63 @@ async function decryptNcryptsec(bytes, passphrase) {
   return KF.xchacha20poly1305(key, bytes.slice(18, 42), bytes.slice(42, 43)).decrypt(bytes.slice(43));
 }
 
+/* The other direction (NKM §4.1). The export is always an ncryptsec
+   and never a raw nsec: §4.1 says so outright, and the reason is that
+   a bare key in a file or on a clipboard is a key with nothing in
+   front of it, where this one has a passphrase and a quarter of a
+   gigabyte of work per guess.
+
+   `log_n` is 18 and the specification permits no other value. It is
+   written into the container as a field because a reader must take
+   the cost from what it is given rather than assume; a writer emits
+   only this one. At 2^18 it is a few seconds of real work on a
+   laptop and rather more on a phone, which is the point, so the
+   progress the caller is handed is not decoration.
+
+   The security byte says the client does not track how the key has
+   been handled. Hearth could claim it had never been handled badly
+   for a key it minted, but the same code exports a key that arrived
+   as text somebody pasted from who knows where, and a field that is
+   sometimes a claim and sometimes a guess is worse than one that
+   says plainly it is not tracked. */
+const NCRYPTSEC_LOG_N = 18;
+const NCRYPTSEC_VERSION = 0x02;
+const NCRYPTSEC_SECURITY_UNKNOWN = 0x02;
+
+async function encryptNcryptsec(privkey, passphrase, onProgress) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const nonce = crypto.getRandomValues(new Uint8Array(24));
+  const key = await KF.scryptAsync(
+    new TextEncoder().encode(passphrase.normalize("NFKC")),
+    salt,
+    { N: 2 ** NCRYPTSEC_LOG_N, r: 8, p: 1, dkLen: 32, asyncTick: 20, onProgress }
+  );
+  const security = new Uint8Array([NCRYPTSEC_SECURITY_UNKNOWN]);
+  // The security byte is the associated data, which is what binds it
+  // to the ciphertext rather than leaving it as a note beside it.
+  const sealed = KF.xchacha20poly1305(key, nonce, security).encrypt(privkey);
+  const container = new Uint8Array(1 + 1 + 16 + 24 + 1 + sealed.length);
+  container[0] = NCRYPTSEC_VERSION;
+  container[1] = NCRYPTSEC_LOG_N;
+  container.set(salt, 2);
+  container.set(nonce, 18);
+  container.set(security, 42);
+  container.set(sealed, 43);
+  return KF.bech32.encode("ncryptsec", KF.bech32.toWords(container), 5000);
+}
+
 // The private key, or a refusal somebody can act on. A key that isn't
 // one and a passphrase that is wrong are the two failures worth
 // telling apart, because only one of them is worth trying again.
 async function privkeyFromText(text, passphrase) {
+  // The backup Hearth writes is a file with a few lines of English
+  // above the key, so what arrives here is often the whole file
+  // rather than the one long word in it. Picking the word out is one
+  // line and saves somebody a careful selection they can get wrong.
+  const found = String(text || "").match(/(ncryptsec1|nsec1)[02-9ac-hj-np-z]+/i);
   let decoded;
   try {
-    decoded = decodeBech32(text);
+    decoded = decodeBech32(found ? found[0].toLowerCase() : text);
   } catch (err) {
     throw new Error("that doesn't look like an nsec or an ncryptsec");
   }
@@ -1847,6 +1907,7 @@ function renderAccountChrome() {
       "leaves is a transfer you start yourself and confirm on both devices.";
   aoExtBtn.hidden = !(hasExtension() && identity.kind !== "extension");
   renderGuard();
+  renderBackup();
 }
 
 /* NKM §2.2 and §2.3, said in the account screen because that is where
@@ -1875,6 +1936,129 @@ async function renderGuard() {
       "claim otherwise; what it stops is any of that happening without you.";
   aoGuardBtn.textContent = enrolled ? "turn it off" : "turn it on";
 }
+
+/* ---------- the backup (NKM §4.1) ----------
+
+   One file, holding the key sealed with a passphrase. §4.1 gives
+   three ways to back a key up and this is the one that needs nobody:
+   platform sync is the operating system's to offer, and the blob
+   store is a service somebody runs. A file is a file.
+
+   The passphrase twice, because a key sealed under a typo is a key
+   nobody opens and there is no way to find that out later — the
+   container does not know what it was meant to say. Both entries are
+   compared and then the produced backup is opened again with the
+   same string before it is shown, so what appears on screen is
+   something that has demonstrably been read back rather than
+   something that was merely written.
+
+   Not offered where an extension holds the key. There is nothing
+   here to seal, and the extension has its own answer. */
+const BACKUP_PASS_MIN = 12;
+let backupString = null;
+
+function renderBackup() {
+  aoBackupSectEl.hidden = !identity || identity.kind === "extension";
+}
+
+function clearBackup() {
+  backupString = null;
+  aoBackupPassEl.value = "";
+  aoBackupPass2El.value = "";
+  aoBackupTextEl.textContent = "";
+  xShow(aoBackupOutEl, false);
+  xShow(aoBackupFailEl, false);
+  aoBackupBtn.disabled = false;
+  aoBackupBtn.textContent = "make a backup";
+}
+
+// What the file says, so that somebody finding it in three years
+// knows what they have found. The key is on its own line and the
+// importer picks it out of the rest, so pasting the whole file works
+// as well as selecting the one long word in it.
+function backupFileText(ncryptsec) {
+  return [
+    "This is a Hearth backup of a nostr identity, sealed with the passphrase",
+    "chosen when it was made. Anyone who has this file can try passwords",
+    "against it for as long as they like, so keep it somewhere private.",
+    "",
+    "To use it, paste the line below into Hearth, or into any client that",
+    "reads NIP-49. Hearth cannot open it for you and cannot recover the",
+    "passphrase.",
+    "",
+    ncryptsec,
+    "",
+  ].join("\n");
+}
+
+aoBackupBtn.addEventListener("click", async () => {
+  xShow(aoBackupFailEl, false);
+  const pass = aoBackupPassEl.value;
+  const again = aoBackupPass2El.value;
+  const fail = (why) => {
+    aoBackupFailEl.textContent = why;
+    xShow(aoBackupFailEl, true);
+  };
+  if (pass.length < BACKUP_PASS_MIN) {
+    fail("That passphrase is short enough to guess. Use at least " + BACKUP_PASS_MIN +
+      " characters, and prefer several words you'll remember over one you won't.");
+    return;
+  }
+  if (pass !== again) {
+    fail("Those two don't match. A backup sealed with a passphrase you mistyped is one " +
+      "nobody can open, including you.");
+    return;
+  }
+  if (!identity || !identity.holdsPrivateKey) {
+    fail("There's no key on this device to back up.");
+    return;
+  }
+  // §2.2: showing or exporting the key is privileged.
+  if (!(await privileged("This writes your key into a file, sealed with the passphrase you " +
+      "just chose."))) {
+    return;
+  }
+  aoBackupBtn.disabled = true;
+  try {
+    // Two hundred and fifty-six megabytes of work per guess is the
+    // point of the cost, and it is also why this takes seconds and
+    // says so while it does.
+    const ncryptsec = await encryptNcryptsec(identity.privkey, pass, (done) => {
+      aoBackupBtn.textContent = "sealing it, " + Math.round(done * 100) + "%";
+    });
+    // Read back before it is shown. A backup that has not been opened
+    // once is a backup nobody has checked.
+    const bytes = decodeBech32(ncryptsec).bytes;
+    const back = await decryptNcryptsec(bytes, pass);
+    if (S.utils.bytesToHex(back) !== S.utils.bytesToHex(identity.privkey)) {
+      throw new Error("what came back out wasn't what went in");
+    }
+    backupString = ncryptsec;
+    drawQr(aoBackupQrEl, ncryptsec);
+    aoBackupTextEl.textContent = ncryptsec;
+    xShow(aoBackupOutEl, true);
+    aoBackupBtn.textContent = "make another";
+  } catch (err) {
+    fail("That backup couldn't be made: " + (err.message || "no reason given"));
+  }
+  aoBackupBtn.disabled = false;
+  if (!backupString) aoBackupBtn.textContent = "make a backup";
+});
+
+aoBackupSaveBtn.addEventListener("click", () => {
+  if (!backupString) return;
+  const blob = new Blob([backupFileText(backupString)], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "hearth-key-" + shortName(identity.pubkey).replace(/[^a-z0-9]/gi, "") + ".txt";
+  a.click();
+  // Revoked on the next turn rather than immediately, because a
+  // download that has not started yet is one the revoke would cancel.
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+});
+
+aoBackupDoneBtn.addEventListener("click", clearBackup);
 
 aoGuardBtn.addEventListener("click", async () => {
   xShow(aoGuardFailEl, false);
