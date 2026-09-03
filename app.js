@@ -35,6 +35,7 @@ const tbNameEl = document.getElementById("tbName");
 const xTrustEl = document.getElementById("xTrust");
 const xTrustBox = document.getElementById("xTrustBox");
 const xTrustTextEl = document.getElementById("xTrustText");
+const aoDevicesEl = document.getElementById("aoDevices");
 const aoBackupSectEl = document.getElementById("aoBackupSect");
 const aoBackupPassEl = document.getElementById("aoBackupPass");
 const aoBackupPass2El = document.getElementById("aoBackupPass2");
@@ -2023,6 +2024,7 @@ function renderAccountChrome() {
   aoExtBtn.hidden = !(hasExtension() && identity.kind !== "extension");
   renderGuard();
   renderBackup();
+  renderDevices();
 }
 
 /* NKM §2.2 and §2.3, said in the account screen because that is where
@@ -2124,6 +2126,203 @@ function readEnrolTags(tags) {
     label: String(enroll[2] || "").trim().slice(0, 40) || "a device",
     installed: (tags || []).some((t) => t[0] === "installed" && t[1] === "1"),
   };
+}
+
+/* ---------- the list, as an event (NKM §7.1) ----------
+
+   §7.1 wants the device list where every one of the person's devices
+   can read it, which means an event rather than a row in each
+   device's own storage. Kind 30242 is addressable and keyed by its
+   `d`, so there is exactly one per identity and a new one replaces
+   the last. In base mode it is NIP-44'd to the person's own pubkey,
+   which is the ordinary way to write something only you can read.
+
+   It goes on public relays, the same ones a transfer travels over
+   and the same kind of place a direct message goes. Not the group's
+   bothy: a device list belongs to a person and a person may be in
+   several groups with one set of devices, so the group's relay is
+   the wrong scope even though it is the relay somebody in the group
+   owns.
+
+   That choice has a cost and it is worth naming rather than
+   discovering. The event is replaceable, addressable and signed by
+   the identity, so a public relay carrying it can see how many
+   devices this identity has and when that number changes, even
+   though it cannot read a single label. §5 already lists a relay
+   counting devices as unmitigated; this makes the count something a
+   relay can read directly rather than infer from subscriptions.
+
+   An identity held by an extension has no list. NIP-44 to oneself
+   needs the key, an extension is not obliged to offer it, and such a
+   device has no enrolment key either — §7 has nothing to say about
+   it, and pretending otherwise would be publishing an empty list
+   under somebody's name. */
+const DEVICE_LIST_KIND = 30242;
+const DEVICE_LIST_D = "devices";
+const DEVICE_LIST_RELAY_WAIT_MS = 4000;
+
+// A socket to each public relay, open just long enough to say one
+// thing or ask one question. Not keyxfer's pool: that one exists to
+// hold a burner's session open for ten minutes, and this is a
+// sentence and a hang-up.
+function briefly(urls, run) {
+  return new Promise((resolve) => {
+    const sockets = [];
+    const results = [];
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      for (const ws of sockets) { try { ws.close(); } catch (e) {} }
+      resolve(results);
+    };
+    const timer = setTimeout(finish, DEVICE_LIST_RELAY_WAIT_MS);
+    for (const url of urls) {
+      let ws;
+      try { ws = new WebSocket(url); } catch (err) { continue; }
+      sockets.push(ws);
+      ws.addEventListener("open", () => run(ws, results, finish));
+      ws.addEventListener("message", (evt) => {
+        let frame;
+        try { frame = JSON.parse(evt.data); } catch (e) { return; }
+        if (frame[0] === "EVENT" && frame[1] === "dl") results.push(frame[2]);
+        if (frame[0] === "EOSE" || frame[0] === "OK") {
+          // One relay answering is enough to have an answer; the rest
+          // are still given the window, because a relay that has the
+          // newer copy may be the slower one.
+        }
+      });
+      ws.addEventListener("error", () => {});
+    }
+    if (sockets.length === 0) { clearTimeout(timer); finish(); }
+  });
+}
+
+async function publishDeviceList() {
+  if (!identity || !identity.holdsPrivateKey) return false;
+  const rows = deviceList();
+  const content = Keyxfer.nip44Encrypt(
+    JSON.stringify({ devices: rows }),
+    Keyxfer.conversationKey(identity.privkey, identity.pubkey));
+  const event = await identity.signEvent({
+    pubkey: identity.pubkey,
+    created_at: Math.floor(Date.now() / 1000),
+    kind: DEVICE_LIST_KIND,
+    tags: [["d", DEVICE_LIST_D]],
+    content,
+  });
+  const frame = JSON.stringify(["EVENT", event]);
+  await briefly(Keyxfer.DEFAULT_RELAYS, (ws) => ws.send(frame));
+  return true;
+}
+
+// The published list, or null where there is none to be had. Merged
+// rather than trusted outright: this device's own row is the one it
+// knows best, and a relay serving a stale copy must not be able to
+// un-enrol a device by being old.
+async function fetchDeviceList() {
+  if (!identity || !identity.holdsPrivateKey) return null;
+  const events = await briefly(Keyxfer.DEFAULT_RELAYS, (ws) => {
+    ws.send(JSON.stringify(["REQ", "dl", {
+      kinds: [DEVICE_LIST_KIND],
+      authors: [identity.pubkey],
+      "#d": [DEVICE_LIST_D],
+      limit: 1,
+    }]));
+  });
+  let newest = null;
+  for (const ev of events) {
+    if (ev.pubkey !== identity.pubkey) continue;
+    if (!newest || ev.created_at > newest.created_at) newest = ev;
+  }
+  if (!newest) return null;
+  try {
+    const plain = Keyxfer.nip44Decrypt(newest.content,
+      Keyxfer.conversationKey(identity.privkey, identity.pubkey));
+    const parsed = JSON.parse(plain);
+    return Array.isArray(parsed.devices) ? parsed.devices : null;
+  } catch (err) {
+    // Signed by this identity and unreadable by it is a list written
+    // under a key this device does not have — nothing useful can be
+    // done with it, and overwriting it blindly would be worse.
+    console.info("hearth: the published device list would not open —", err.message);
+    return null;
+  }
+}
+
+// This device's own row. The one place a device writes its own, and
+// it is not an exception to §7.1's rule so much as the case that
+// rule does not cover: the row belongs to whichever device created
+// the identity, and there was no Sender to write it.
+function selfDeviceRow() {
+  if (!enrolment) return null;
+  return {
+    pubkey: enrolment.pub,
+    label: deviceLabelProposal(),
+    // The device that made the identity holds the whole key already,
+    // so no decision of anybody's is being anticipated here.
+    role: runningInstalled() ? "trusted" : "restricted",
+    storage_level: STORAGE_LEVEL,
+    mode: "base",
+    // Nothing admitted it and nothing needed to: admission is what
+    // lets a device that was given a share use it, and this one was
+    // given the key itself.
+    admitted: true,
+    self: true,
+    at: Math.floor(Date.now() / 1000),
+  };
+}
+
+/* This device's row, the published list, and whatever each of them
+   knows that the other does not. A row is kept per enrolment key and
+   the newer of two wins, so a relay serving a stale copy cannot
+   un-enrol a device by being old, and a device enrolled on another
+   of the person's devices appears here without anybody typing
+   anything. */
+async function syncDevices() {
+  if (!identity || !identity.holdsPrivateKey || !enrolment) return;
+  const self = selfDeviceRow();
+  const known = new Map();
+  for (const row of deviceList()) known.set(row.pubkey, row);
+  if (self && !known.has(self.pubkey)) known.set(self.pubkey, self);
+  const before = JSON.stringify(Array.from(known.values()));
+
+  const published = await fetchDeviceList();
+  for (const row of published || []) {
+    if (!row || typeof row.pubkey !== "string") continue;
+    const mine = known.get(row.pubkey);
+    if (!mine || (row.at || 0) > (mine.at || 0)) known.set(row.pubkey, row);
+  }
+  const rows = Array.from(known.values());
+  localStorage.setItem(DEVICES_KEY, JSON.stringify(rows.slice(-32)));
+  renderDevices();
+  // Only where this device knows something the published copy did
+  // not. Republishing an unchanged list every launch would be one
+  // more thing for a relay to time.
+  if (JSON.stringify(rows) !== before || !published) await publishDeviceList();
+}
+
+function renderDevices() {
+  aoDevicesEl.innerHTML = "";
+  const rows = deviceList();
+  if (rows.length < 2) return; // one device is not a list
+  for (const row of rows) {
+    const el = document.createElement("div");
+    el.className = "devRow";
+    const name = document.createElement("span");
+    name.className = "devName";
+    name.textContent = row.label + (row.self ? " (this one)" : "");
+    const tag = document.createElement("span");
+    tag.className = "devTag" + (row.admitted ? "" : " waiting");
+    // §7.1's two facts about a device, in the words they mean rather
+    // than in the specification's: trusted is "you said this one is
+    // yours", and admitted is whether it has been let in.
+    tag.textContent = !row.admitted
+      ? "not let in yet"
+      : (row.role === "trusted" ? "yours" : "limited");
+    el.append(name, tag);
+    aoDevicesEl.appendChild(el);
+  }
 }
 
 /* ---------- the backup (NKM §4.1) ----------
@@ -6523,6 +6722,11 @@ function noteEnrolled(enrol, trusted) {
     admitted: false,
     at: Math.floor(Date.now() / 1000),
   });
+  renderDevices();
+  // Where the other devices can read it. Failing is not fatal: the
+  // row is written down here either way, and the next launch tries
+  // again.
+  publishDeviceList().catch(() => {});
 }
 
 // §7 steps 15 and 16, §8 step 16: the key is in hand and still not
@@ -6763,6 +6967,10 @@ function start(relayUrl) {
     // moment an authenticated channel and an attentive person both
     // exist.
     enrolment = await acquireEnrolmentKey();
+    // §7.1's list, reconciled with whatever the person's other
+    // devices have published. Not awaited: it talks to relays, and
+    // nothing on the way in depends on the answer.
+    syncDevices().catch(() => {});
   } catch (err) {
     // A corrupted identity store is a stop, not a shrug: minting a
     // fresh key here would silently replace whoever this device used

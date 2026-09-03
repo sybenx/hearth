@@ -740,6 +740,16 @@ input{font:inherit;color:inherit;background:none;border:none}
    with a transfer, and it sits above everything including that. */
 /* The backup, once it exists: a code that can be photographed or
    printed, and the same thing as text for a clipboard. */
+/* NKM §7.1's list, shown. One row per device: what it is called,
+   what its owner said it was, and whether it has been let in. */
+.deviceList{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+.devRow{
+  display:flex;align-items:baseline;gap:8px;padding:9px 11px;border-radius:10px;
+  background:var(--raise2);border:1px solid var(--line2);
+}
+.devName{font-size:13px;color:var(--ink);flex:1;text-align:left}
+.devTag{font-size:11px;color:var(--faint);white-space:nowrap}
+.devTag.waiting{color:var(--ember)}
 .backupOut{display:flex;flex-direction:column;gap:10px;margin-top:12px;align-items:center}
 .backupOut canvas{
   width:100%;max-width:230px;height:auto;background:var(--ink);
@@ -1161,6 +1171,7 @@ input{font:inherit;color:inherit;background:none;border:none}
         <div class="secNote" id="aoReceiveOnly"></div>
         <button class="pillBtn" id="aoAllowSend"></button>
       </div>
+      <div class="deviceList" id="aoDevices"></div>
       <div class="relayList" id="aoTransfers"></div>
     </div>
 

@@ -1622,9 +1622,13 @@ global.Keyxfer = {
   MAX_ATTEMPTS,
   burnerRefused,
   failuresWorthMentioning,
-  // The pieces below are exported for the vector checker, which
-  // has to be able to reach every step the specification pins a
-  // known answer to.
+  // The pieces below are exported for the vector checker, which has
+  // to be able to reach every step the specification pins a known
+  // answer to — and, for the NIP-44 three, because NIP-44 is a NIP
+  // rather than this file's own. Hearth encrypts its own events with
+  // them instead of carrying a second copy of the same construction,
+  // which is a dependency on a published standard and not on
+  // anything about a transfer.
   nip44Encrypt,
   nip44Decrypt,
   conversationKey,
