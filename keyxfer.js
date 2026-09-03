@@ -976,6 +976,11 @@ function startSession(opts) {
   // first, and it is never all of them at once.
   let displayAt = 0;
   let scanned = opts.scanned || null;       // what the QR said, when we scanned one
+  /* §5 item 6: the profile's tags on the two messages a receiving
+     party gets to send — the one that opens flow B, and the
+     acknowledgement that ends either flow. Supplied by the caller,
+     which is what knows the profile; this file only carries them. */
+  const profileTags = opts.tags || {};
   const relays = (scanned ? scanned.relays : (opts.relays || DEFAULT_RELAYS)).slice(0, 4);
 
   const sessionTimer = setTimeout(() => stop("expired"), SESSION_SECONDS * 1000);
@@ -1102,6 +1107,9 @@ function startSession(opts) {
       const peer = peerFor(from);
       peer.commit = commit;
       peer.nonce = S.utils.randomBytes(32);
+      // §5 item 6: whatever the profile put on its opening message.
+      // This file has no idea what any of it means and hands it on.
+      peer.tags = rumor.tags || [];
       noteResponder();
       await send(KINDS.NONCE, [["nonce", toHex(peer.nonce)]], "", from);
       return;
@@ -1183,7 +1191,10 @@ function startSession(opts) {
       if (role !== "holder") return;
       const peer = peers.get(from);
       if (!peer || !peer.sent) return;
-      stop("done");
+      // The acknowledgement carries the profile's tags too, which is
+      // the only place a flow-A receiver gets to say anything: it
+      // sends no opening message, so this is its one turn to speak.
+      stop("done", { peer: from, tags: rumor.tags || [] });
       return;
     }
 
@@ -1268,6 +1279,11 @@ function startSession(opts) {
       // page load looks the same whichever app put it there.
       position: (displayAt % Math.max(1, candidates().length)) + 1,
       total: candidates().length,
+      // The profile's own tags off the message that opened this, for
+      // a caller that knows what they say. Empty in the flow where
+      // this device spoke first and the other has not yet answered
+      // with anything but a nonce.
+      tags: peer.tags || [],
     });
   }
 
@@ -1487,7 +1503,7 @@ function startSession(opts) {
         peer: peerHex,
         multi: multiSeen,
       };
-      await send(KINDS.ACK, [], "", peerHex);
+      await send(KINDS.ACK, profileTags.ack || [], "", peerHex);
       // A moment for the acknowledgement to reach a relay before
       // the sockets are closed under it; the holder's own minute
       // covers it either way.
@@ -1586,12 +1602,12 @@ function startSession(opts) {
     ownNonce = S.utils.randomBytes(32);
     ownCommit = await sasCommit(burner.pub, ownNonce);
     const kind = flow === "A" ? KINDS.HELLO : KINDS.REQUEST;
-    // The profile's REQUEST also carries an `enroll` tag naming a
-    // threshold enrolment key. Hearth has no threshold signing and
-    // so has no such key, and a tag naming a key that does not
-    // exist would be worse than an absent one.
     peerFor(scanned.burner);
-    await send(kind, [["commit", ownCommit]], "", scanned.burner);
+    // Only the flow-B opener carries them: flow A's first message is
+    // sent by the party releasing the secret, which has nothing to
+    // enrol and nothing to say.
+    const opening = flow === "B" ? (profileTags.request || []) : [];
+    await send(kind, [["commit", ownCommit]].concat(opening), "", scanned.burner);
     emit("sent-hello");
   })();
 

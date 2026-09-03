@@ -32,6 +32,9 @@ const stageEl = document.getElementById("stage");
 const mainEl = document.getElementById("main");
 const pillSlotEl = document.getElementById("pillSlot");
 const tbNameEl = document.getElementById("tbName");
+const xTrustEl = document.getElementById("xTrust");
+const xTrustBox = document.getElementById("xTrustBox");
+const xTrustTextEl = document.getElementById("xTrustText");
 const aoBackupSectEl = document.getElementById("aoBackupSect");
 const aoBackupPassEl = document.getElementById("aoBackupPass");
 const aoBackupPass2El = document.getElementById("aoBackupPass2");
@@ -268,6 +271,118 @@ async function storeSealedPrivkey(privkey) {
     tx.onabort = () => reject(tx.error);
   });
   db.close();
+}
+
+/* ------------------------------------------------------------
+   this device's own key (NKM §7.1)
+
+   Separate from the identity and not derived from it. `E` is what
+   makes a device addressable for as long as it is a device: the
+   identity's key may be split across several devices or held by none
+   of them, and every §7 operation — a share arriving, a rotation, a
+   revocation — has to reach one particular device long after the
+   session that enrolled it has ended. A burner cannot do that; it
+   exists for ten minutes by design.
+
+   It is stored exactly as the identity is, sealed under a key this
+   page can use and never read out, and for the same reason: it is
+   what a co-signer or another of the person's devices authenticates,
+   so a copy of it is the ability to be this device.
+
+   Made once, at first run, before anybody has decided whether they
+   will ever split a key. That is deliberate. §3.1 has the receiving
+   device announce `E.pub` during a transfer, and a device that only
+   generated one when it needed it would have nothing to announce at
+   the one moment the specification says both an authenticated channel
+   and an attentive person exist.
+   ------------------------------------------------------------ */
+async function loadEnrolmentKey() {
+  const db = await idbOpen();
+  const sealKey = await idbGet(db, "sealKey");
+  const sealed = await idbGet(db, "enrolKey");
+  db.close();
+  if (!sealKey || !sealed) return null;
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: sealed.iv }, sealKey, sealed.ciphertext);
+  return new Uint8Array(plain);
+}
+
+// Sealed under the same key the identity is, which is why this waits
+// for that key to exist rather than making one of its own. A second
+// sealing key would be a second thing to lose.
+async function storeEnrolmentKey(privkey) {
+  const db = await idbOpen();
+  const sealKey = await idbGet(db, "sealKey");
+  if (!sealKey) { db.close(); throw new Error("there is no sealing key on this device yet"); }
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, sealKey, privkey);
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put({ iv, ciphertext }, "enrolKey");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+  db.close();
+}
+
+// The key, made if this device has never had one. Null where the
+// identity lives in an extension and there is no sealing key here to
+// seal it under; such a device is not one §7 can enrol anyway.
+let enrolment = null;
+
+async function acquireEnrolmentKey() {
+  try {
+    let priv = await loadEnrolmentKey();
+    if (!priv) {
+      priv = S.utils.randomPrivateKey();
+      await storeEnrolmentKey(priv);
+    }
+    return { priv, pub: S.utils.bytesToHex(S.schnorr.getPublicKey(priv)) };
+  } catch (err) {
+    // A device with no sealed store, or one that will not open. It
+    // goes on working as it always did; what it cannot do is be
+    // enrolled, and nothing yet asks it to be.
+    console.info("hearth: no enrolment key on this device —", err.message);
+    return null;
+  }
+}
+
+/* What this device would like to be called, for the device that is
+   about to write it down. §7.1 is firm that the label is the
+   Sender's to set and that a Receiver must never set or change its
+   own, so this is a proposal and is named like one. A person looking
+   at a list of their own devices wants "iPhone", not a user agent. */
+function deviceLabelProposal() {
+  const ua = navigator.userAgent || "";
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || "";
+  if (/iPhone/.test(ua)) return "iPhone";
+  if (/iPad/.test(ua)) return "iPad";
+  if (/Android/.test(ua)) return /Mobile/.test(ua) ? "Android phone" : "Android tablet";
+  if (/Macintosh|Mac OS X/.test(ua) || platform === "macOS") return "Mac";
+  if (/Windows/.test(ua) || platform === "Windows") return "Windows PC";
+  if (/Linux|X11/.test(ua) || platform === "Linux") return "Linux computer";
+  return "a browser";
+}
+
+/* Whether this copy is running as something the person installed
+   rather than as a tab (CLAUDE.md's deviation). Read each time rather
+   than once, because it changes under a running page: a copy opened
+   from the home screen and a copy opened from a browser are the same
+   address and the same storage, and only this tells them apart.
+
+   It is a claim, not a proof. It travels to the other device as one
+   more unverified thing the prompt may mention, exactly as `origin`
+   does, and it decides only whether the question is asked — never the
+   answer, which is the person's. */
+function runningInstalled() {
+  try {
+    if (window.navigator.standalone === true) return true; // iOS Safari
+    return window.matchMedia("(display-mode: standalone)").matches ||
+      window.matchMedia("(display-mode: window-controls-overlay)").matches;
+  } catch (err) {
+    return false;
+  }
 }
 
 // A key this device holds. holdsPrivateKey is what a caller is
@@ -1935,6 +2050,80 @@ async function renderGuard() {
       "It cannot stop a page on this address reading what it stores, and Hearth does not " +
       "claim otherwise; what it stops is any of that happening without you.";
   aoGuardBtn.textContent = enrolled ? "turn it off" : "turn it on";
+}
+
+/* ---------- the devices this identity is on (NKM §7.1) ----------
+
+   One row per device: the key that addresses it, what it is called,
+   whether its owner said it was theirs, how well this platform can
+   keep a secret, and whether it has been let in. §7.1 asks for that
+   list as a signed event so every device can read it; this writes it
+   down locally first, because there is nothing yet for the other
+   devices to do with it and a list nobody reads is not worth
+   publishing badly.
+
+   `admitted` starts false and stays false. §7.1 is exact about what
+   that means: enrolment gives a device a share, admission gives it
+   access, and they are separate acts because the enrolling channel
+   is the one an attacker would be attacking. Nothing here admits
+   anything, because there is nothing to admit to yet.
+
+   `storage_level` is 2 for every hearth. §2.1 puts a browser there
+   and says why it can never be 3: there is no authenticator-bound
+   decryption in a browser, so the key is unwrapped by something any
+   script on this address can use. Writing 2 is writing the truth
+   about what this device can promise. */
+const DEVICES_KEY = "hearth:devices";
+const STORAGE_LEVEL = 2;
+
+function deviceList() {
+  try {
+    const rows = JSON.parse(localStorage.getItem(DEVICES_KEY) || "[]");
+    return Array.isArray(rows) ? rows : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+// Keyed by the enrolment key, which is what §7.1 addresses a device
+// by. A device enrolled twice is one row updated, not two rows: the
+// second transfer is somebody redoing the first, and two rows for one
+// device would be two things to revoke.
+function rememberDevice(row) {
+  const rows = deviceList().filter((d) => d.pubkey !== row.pubkey);
+  rows.push(row);
+  localStorage.setItem(DEVICES_KEY, JSON.stringify(rows.slice(-32)));
+}
+
+/* §3.1's `enroll` tag: this device's stable key and what it would
+   like to be called. It goes on the message that opens flow B and on
+   the acknowledgement that ends either flow, which between them are
+   the only two messages a receiving party sends.
+
+   `installed` is hearth's own and no other client will send or read
+   it. It says this copy is running as something its owner installed
+   rather than as a tab, which is what CLAUDE.md's deviation makes the
+   condition for being offered as trusted. Unverified, like `origin`,
+   and it informs the prompt rather than the role. */
+function enrolTags() {
+  if (!enrolment) return {};
+  const tags = [["enroll", enrolment.pub, deviceLabelProposal()]];
+  if (runningInstalled()) tags.push(["installed", "1"]);
+  return { request: tags, ack: tags };
+}
+
+// What the other device said about itself, off those tags.
+function readEnrolTags(tags) {
+  const enroll = (tags || []).find((t) => t[0] === "enroll" && /^[0-9a-f]{64}$/.test(t[1] || ""));
+  if (!enroll) return null;
+  return {
+    pubkey: enroll[1],
+    // A label is a string the other device chose, so it is trimmed,
+    // cut to something a list can show, and given a fallback. It is
+    // written down by this device, which is §7.1's whole point.
+    label: String(enroll[2] || "").trim().slice(0, 40) || "a device",
+    installed: (tags || []).some((t) => t[0] === "installed" && t[1] === "1"),
+  };
 }
 
 /* ---------- the backup (NKM §4.1) ----------
@@ -5472,6 +5661,22 @@ function setCodeEntry(code) {
   setTimeout(() => xCodeInput.focus(), 0);
 }
 
+/* §7.1's box, and its exact words. It appears only where the other
+   device says it is running as something its owner installed, which
+   is the eligibility CLAUDE.md's deviation defines — and that claim
+   is unverified, so all it decides is whether the question gets
+   asked. The answer is the person's, and they are holding both
+   devices while they give it.
+
+   Unticked, always, and never remembered. §7.1: "A Receiver's role is
+   chosen by the Sender's user, never by the Receiver." A box that
+   came up ticked would be the Receiver choosing. */
+function setTrustBox(on) {
+  xShow(xTrustEl, !!on);
+  xTrustBox.checked = false;
+  if (on) xTrustTextEl.textContent = "Trust this device — it's my own app on hardware I own";
+}
+
 function setAcknowledgement(ack) {
   xShow(xAckEl, !!ack);
   xAckBox.checked = false;
@@ -5517,6 +5722,7 @@ function xRender(opts) {
   xShow(xSasEl, !!opts.sas);
   if (opts.sas) xDigitsEl.textContent = opts.sas.digits;
   setCodeEntry(opts.code || null);
+  setTrustBox(opts.trust || false);
   setAcknowledgement(opts.ack || null);
   xButtonsEl.innerHTML = "";
   for (const b of opts.buttons || []) {
@@ -5792,6 +5998,11 @@ function beginShowing() {
     role: xferRole,
     showing: true,
     relays: Keyxfer.DEFAULT_RELAYS,
+    // §3.1: this device's enrolment key, on the two messages a
+    // receiving party gets to send. Ignored by the session, which
+    // does not know what they mean, and ignored by the other device
+    // where it is the one receiving.
+    tags: enrolTags(),
     on: onTransferEvent,
   });
   watchTransport();
@@ -5813,6 +6024,7 @@ function beginScanned(scanned) {
     role: xferRole,
     showing: false,
     scanned,
+    tags: enrolTags(),
     on: onTransferEvent,
   });
   watchTransport();
@@ -6030,6 +6242,14 @@ async function onTransferEvent(type, data) {
 
   if (type === "done") {
     if (xferRole === "holder") {
+      // §3.1: in flow A this is the first and only thing the other
+      // device says about itself. It arrives after the key, which is
+      // late for choosing a role and exactly on time for writing down
+      // where the device can be reached.
+      const late = readEnrolTags(data && data.tags);
+      if (late && !deviceList().some((d) => d.pubkey === late.pubkey)) {
+        noteEnrolled(late, false);
+      }
       xRender({
         title: "add a device",
         note: "Your other device has your identity now.",
@@ -6158,7 +6378,14 @@ function renderConsent(data) {
     ? " This is device " + data.position + " of the " + data.total + " that answered."
     : "";
 
-  const send = () => sendKey(data);
+  // §7.1 and §3.1: what the other device says it is. Flow B carries
+  // it on the message that opened the session; in flow A there is no
+  // such message and it arrives on the acknowledgement instead, after
+  // the key has gone — so the box below is a flow-B screen, and a
+  // flow-A device is enrolled as restricted and promoted later from
+  // the devices screen if its owner wants it trusted.
+  const enrol = readEnrolTags(data.tags);
+  const send = () => sendKey(data, enrol);
   const decline = { label: "don't send", onClick: () => xfer && xfer.deny(data.peer) };
 
   xRender({
@@ -6181,6 +6408,12 @@ function renderConsent(data) {
             // §9.1: at maximum friction the prompt asks for a
             // deliberate act beyond the one tap. The tick is what
             // arms the control; without it the control does nothing.
+            // §7.1: unticked, and shown only where the other device
+            // says it is an installed app rather than a tab. The
+            // claim is unverified and decides only whether the
+            // question is asked; the answer is the person's, and
+            // they are holding both devices as they give it.
+            trust: !!(enrol && enrol.installed),
             ack: maximum ? {
               label: "I mean to give my key to " + named + ", and I know it keeps a " +
                 "working copy for good",
@@ -6251,7 +6484,7 @@ function renderConsent(data) {
 const RELAY_TAG = "relay";
 const RELAYS_SENT_MAX = 8;
 
-async function sendKey(data) {
+async function sendKey(data, enrol) {
   // NKM §2.2: acting as Sender is privileged, so the person is asked
   // once more with the platform's own prompt. Complementary to the
   // code and never instead of it — qrst §9.2 is explicit that a
@@ -6264,9 +6497,31 @@ async function sendKey(data) {
   }
   xRender({ title: "add a device", sas: data.sas, waiting: "sending" });
   const relays = rememberedRelays().slice(0, RELAYS_SENT_MAX);
+  // §7.1: the role is read off the box before the key goes, because
+  // afterwards there is no screen and no person to ask. Restricted
+  // unless the box was there and was ticked.
+  const trusted = !!(enrol && enrol.installed && xTrustBox.checked);
   await xfer.approve(data.peer, S.utils.bytesToHex(identity.privkey), {
     lock: "device",
     tags: relays.map((url) => [RELAY_TAG, url]),
+  });
+  if (enrol) noteEnrolled(enrol, trusted);
+}
+
+/* §7.1: one row for the device that was just given the key. Written
+   by this device, which is the Sender, because the Receiver must
+   never write its own label or choose its own role. */
+function noteEnrolled(enrol, trusted) {
+  rememberDevice({
+    pubkey: enrol.pubkey,
+    label: enrol.label,
+    role: trusted ? "trusted" : "restricted",
+    storage_level: STORAGE_LEVEL,
+    mode: "base",
+    // §7.1: enrolment gives a device a share, admission gives it
+    // access, and nothing here admits anything.
+    admitted: false,
+    at: Math.floor(Date.now() / 1000),
   });
 }
 
@@ -6501,6 +6756,13 @@ function start(relayUrl) {
 
   try {
     identity = await acquireIdentity();
+    // §7.1: made at first run, before anybody has decided whether
+    // they will ever split a key, because §3.1 has this device
+    // announce it during a transfer and a device that made one only
+    // when it needed it would have nothing to announce at the one
+    // moment an authenticated channel and an attentive person both
+    // exist.
+    enrolment = await acquireEnrolmentKey();
   } catch (err) {
     // A corrupted identity store is a stop, not a shrug: minting a
     // fresh key here would silently replace whoever this device used
