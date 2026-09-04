@@ -1359,6 +1359,10 @@ input{font:inherit;color:inherit;background:none;border:none}
 <script src="vendor/jsqr.js"></script>
 <script src="kinds.js"></script>
 <script src="keyxfer.js"></script>
+<!-- The interface, not the implementation. vendor/noble-frost.js is
+     seventy kilobytes and is fetched by the first threshold operation,
+     so a person who never splits their key never downloads it. -->
+<script src="frost.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

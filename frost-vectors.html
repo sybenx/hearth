@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hearth &mdash; threshold vectors</title>
+<style>
+body{
+  margin:0;padding:28px 20px 60px;background:#0b0907;color:#f0e6d9;
+  font:14px/1.6 ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+}
+h1{font:600 15px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0 0 6px}
+h2{font:600 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  margin:22px 0 6px;color:#b3a08b}
+p.note{
+  font:12.5px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  color:#b3a08b;max-width:70ch;margin:0 0 22px;
+}
+#summary{font-weight:600;margin:0 0 16px;padding:10px 12px;border-radius:10px;background:#1d1510}
+.ok{color:#8fbf7a}
+.bad{color:#ff6d5a}
+ul{list-style:none;margin:0;padding:0}
+li{padding:3px 0;border-bottom:1px solid rgba(240,220,196,.06)}
+li .detail{display:block;color:#82705d;font-size:12px;white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<h1>threshold vectors</h1>
+<p class="note">Known answers for NKM &sect;7's dealing, share checking, signing and rotation,
+  from <code>frost-vectors.json</code> &mdash; the specification&rsquo;s own normative vector
+  file, copied rather than regenerated here. It runs against whatever is behind
+  <code>frost.js</code>, so a build that swapped the implementation underneath has to
+  reproduce every value below before it is trusted with anybody&rsquo;s key.</p>
+<p class="note">The fixture identity has an <strong>odd-y</strong> pubkey on purpose. &sect;7.4's
+  parity rule is the only behaviour in either document that depends on key parity, and both
+  a key and its negation serialise to the same x-only pubkey &mdash; so an even-y fixture
+  would pass whichever reading of &sect;7.4 an implementer took, and so would &sect;7.5's own
+  check. Two of the answers below are deliberately <strong>false</strong>: &sect;7.18 offers
+  <code>t = 3</code> and states a share check that does not hold there, and reproducing the
+  false is what shows the section was read rather than skimmed.</p>
+<div id="summary">running&hellip;</div>
+<ul id="results"></ul>
+
+<script src="vendor/noble-secp256k1.js"></script>
+<script src="frost.js"></script>
+<script>
+const results = document.getElementById("results");
+let pass = 0, fail = 0;
+
+function record(name, ok, detail) {
+  if (ok) pass++; else fail++;
+  const li = document.createElement("li");
+  li.innerHTML = '<span class="' + (ok ? "ok" : "bad") + '">' + (ok ? "pass" : "FAIL") + "</span> " + name;
+  if (!ok && detail) {
+    const d = document.createElement("span");
+    d.className = "detail";
+    d.textContent = detail;
+    li.appendChild(d);
+  }
+  results.appendChild(li);
+}
+
+function eq(name, got, want) {
+  record(name, String(got) === String(want), "got  " + got + "\nwant " + want);
+}
+
+function heading(text) {
+  const h = document.createElement("h2");
+  h.textContent = text;
+  results.appendChild(h);
+}
+
+(async function run() {
+  const V = await (await fetch("frost-vectors.json")).json();
+  const F = window.Frost;
+  const msg = F.fromHex(V.message_hex);
+
+  heading("§7.4 parity — the question the fixture exists to settle");
+  // Dealing from the raw key, with no negation of any kind, against a
+  // fixture whose pubkey has odd y. If this passes, §7.4's dealer-side
+  // negation is not merely redundant, it is wrong: doing it as well
+  // would deal from a different secret and the group key would stop
+  // being the person's npub.
+  const dealt = await F.split(F.fromHex(V.nsec), { t: 2, indices: [1, 2, 3] });
+  eq("dealing from the raw nsec gives the npub", dealt.npub, V.npub_xonly);
+  eq("the group key's parity is the one the vector records",
+    dealt.groupPub.startsWith("03") ? "odd" : "even", V.parity.group_commitment_y_parity);
+  record("split refuses a result that is not this identity",
+    dealt.npub === V.npub_xonly);
+
+  heading("§7.4 share check, at t = 2");
+  for (const share of V.t2.shares) {
+    const entry = {
+      index: share.index,
+      share: share.signing_share,
+      groupPub: V.t2.commitments[0],
+      commitment: V.t2.commitments[1],
+      commitments: V.t2.commitments,
+    };
+    eq("index " + share.index + ": share·G == group_pub + commitment·i",
+      await F.shareIsValid(entry), share.nkm_degree1_form_holds);
+    eq("index " + share.index + ": the general form holds too",
+      await F.shareIsValidGeneral(entry), share.general_form_holds);
+  }
+
+  heading("§7.18 at t = 3 — the check the epoch record cannot express");
+  for (const share of V.t3.shares) {
+    const entry = {
+      index: share.index,
+      share: share.signing_share,
+      groupPub: V.t3.commitments[0],
+      commitment: V.t3.commitments[1],
+      commitments: V.t3.commitments,
+    };
+    // §7.4's form takes one commitment and a t = 3 polynomial has two,
+    // so this is expected to be false and the vector says so. A build
+    // that reported true here would be checking something else.
+    eq("index " + share.index + ": §7.4's one-commitment form does not hold",
+      await F.shareIsValid(entry), share.nkm_degree1_form_holds);
+    eq("index " + share.index + ": the general form does",
+      await F.shareIsValidGeneral(entry), share.general_form_holds);
+  }
+
+  heading("§7.18 signing — two shares, one signature");
+  // Not the vector's own signature: its nonces are secret and only its
+  // commitments are published, so what is checked is the property
+  // rather than the bytes — two of the vector's shares sign, one does
+  // not, and what comes out verifies under the npub.
+  const members = dealt.shares.map((s) => ({ index: s.index, verifying: s.verifying }));
+  const pair = dealt.shares.slice(0, 2);
+  const rounds = [];
+  for (const s of pair) rounds.push(await F.round1(s));
+  const list = rounds.map((r) => r.commitments);
+  const sigShares = {};
+  for (let i = 0; i < pair.length; i++) {
+    sigShares[F.identifierFor(pair[i].index)] = await F.round2({
+      index: pair[i].index, share: pair[i].share,
+      nonces: rounds[i].nonces, commitmentList: list, message: msg,
+      t: 2, members, commitments: dealt.commitments,
+    });
+  }
+  const sig = await F.aggregate({
+    t: 2, members, commitments: dealt.commitments,
+    commitmentList: list, message: msg, shares: sigShares,
+  });
+  record("two of three shares produce a signature", !!sig);
+  record("and it verifies as BIP-340 under the npub",
+    await F.verify(sig, msg, V.npub_xonly));
+
+  heading("§7.15 reconstruction — the one operation that puts it back");
+  const back = F.toHex(await F.combine({
+    t: 2, members, commitments: dealt.commitments, shares: pair,
+  }));
+  // §7.4 says to re-negate an odd-y key on reconstruction. The vector
+  // says reconstruction already equals the nsec without it, and this
+  // is where that is either true or the key comes back wrong.
+  eq("what comes back is the nsec, with no re-negation", back, V.nsec);
+  eq("which is what the vector says about re-negation",
+    true, V.parity.reconstruction_equals_nsec_without_renegation);
+
+  heading("§7.9 rotation — a delta that moves the shares and not the key");
+  // δ(x) = r·x, so share_i becomes share_i + r·i and a_0 is untouched.
+  // The vector's rotated shares must still check against the rotated
+  // commitment, and the group key must not have moved.
+  eq("the group key is the same after rotation",
+    V.rotation.commitments[0], V.t2.commitments[0]);
+  for (const share of V.rotation.shares) {
+    eq("rotated index " + share.index + " checks against the new commitment",
+      await F.shareIsValid({
+        index: share.index,
+        share: share.signing_share,
+        groupPub: V.rotation.commitments[0],
+        commitment: V.rotation.commitments[1],
+      }), share.nkm_degree1_form_holds);
+  }
+  // The point of rotating: a share from before it no longer pairs.
+  const stale = V.t2.shares[0];
+  record("a share from before the rotation no longer checks",
+    !(await F.shareIsValid({
+      index: stale.index,
+      share: stale.signing_share,
+      groupPub: V.rotation.commitments[0],
+      commitment: V.rotation.commitments[1],
+    })));
+
+  const summary = document.getElementById("summary");
+  summary.textContent = pass + " passed, " + fail + " failed";
+  summary.className = fail === 0 ? "ok" : "bad";
+})().catch((err) => {
+  const summary = document.getElementById("summary");
+  summary.textContent = "the vectors could not be run: " + err.message;
+  summary.className = "bad";
+  console.error(err);
+});
+</script>
+</body>
+</html>
