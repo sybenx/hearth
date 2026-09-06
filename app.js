@@ -1723,6 +1723,32 @@ async function handleFrame(frame, relayUrl, epoch) {
       } else if (message && message.startsWith("auth-required") && authState !== "failed") {
         entry.lastReason = message;
         // left in the outbox; resent once the pending AUTH above completes
+      } else if (message && message.startsWith("rate-limited")) {
+        // Batching (queueCandidate) is what keeps a negotiation under the
+        // relay's allowance; this is the backstop for when something else
+        // on the same connection has already spent it -- a second person
+        // in the call behind the same address, since bothy keys the
+        // throttle by IP rather than by connection. Dropping the event
+        // here is what made a call come up on a worse path than it should
+        // have, so it is retried rather than reported. Signalling is
+        // worth retrying and a presence beat is not: another beat is due
+        // in five seconds and a stale one is worse than none.
+        const isBeat = entry.event.kind === KINDS.CALL_PRESENCE;
+        entry.attempts = (entry.attempts || 0) + 1;
+        if (isBeat || entry.attempts > EPHEMERAL_MAX_ATTEMPTS) {
+          outbox.delete(eventId);
+          if (!isBeat) {
+            showBanner("[call] " + entry.label + " refused: " + message);
+          }
+        } else {
+          // Backing off past the relay's own 10s window, with a jitter so
+          // that two peers refused in the same burst do not retry in step
+          // and spend the allowance on each other a second time.
+          const wait = EPHEMERAL_RETRY_MS * entry.attempts + Math.random() * 400;
+          setTimeout(() => {
+            if (outbox.has(eventId)) sendEvent(entry.event);
+          }, wait);
+        }
       } else {
         outbox.delete(eventId);
         // a dropped ICE candidate or presence beat stalls the call with no
@@ -3012,6 +3038,64 @@ function sendSignal(pubkey, payload) {
   );
 }
 
+// ICE candidates arrive from the browser one event at a time and in a
+// burst -- a dozen or more per peer, within a second of the connection
+// being laid out, and once per peer, so a call with five people in it
+// emits five of those bursts at once. Sent one nostr event apiece that is
+// straightforwardly too many: bothy throttles a connection at 50 messages
+// per 10 seconds, shared with REQs, chat and the presence beat, and
+// measured against the live relay a 120-event burst had 78 of them
+// refused. A refused candidate is not retried by the far side because the
+// far side never hears about it; the call then comes up on a worse path
+// than it should have, or does not come up, depending on which candidates
+// happened to survive. That is what makes it intermittent.
+//
+// Pacing alone is the wrong fix. ICE is time-critical -- a candidate that
+// arrives after the far side has given up is no better than one that was
+// dropped -- so spreading the same twenty events across seven seconds
+// trades a burst failure for a timeout. Batching removes the messages
+// instead of moving them: candidates are collected for a very short
+// window and sent as ONE event carrying an array, which turns a dozen
+// messages into one or two and leaves the burst inside the relay's
+// allowance without delaying it meaningfully.
+const CANDIDATE_BATCH_MS = 120;
+// A refused signal is retried rather than dropped. The wait clears
+// bothy's 10-second throttle window; three attempts is about as long as
+// an ICE candidate is worth anything for, after which the connection has
+// either come up on another path or failed over.
+const EPHEMERAL_RETRY_MS = 1200;
+const EPHEMERAL_MAX_ATTEMPTS = 3;
+const candidateBatches = new Map(); // pubkey -> { list, timer }
+
+function queueCandidate(pubkey, candidate) {
+  let batch = candidateBatches.get(pubkey);
+  if (!batch) {
+    batch = { list: [], timer: null };
+    candidateBatches.set(pubkey, batch);
+  }
+  batch.list.push(candidate);
+  if (batch.timer === null) {
+    batch.timer = setTimeout(() => flushCandidates(pubkey), CANDIDATE_BATCH_MS);
+  }
+}
+
+function flushCandidates(pubkey) {
+  const batch = candidateBatches.get(pubkey);
+  if (!batch) return;
+  candidateBatches.delete(pubkey);
+  if (batch.timer !== null) clearTimeout(batch.timer);
+  if (batch.list.length === 0) return;
+  // `candidates`, plural, is the new shape. A hearth that predates this
+  // ignores an unknown payload type, so the single-candidate form is
+  // still sent when there is only one -- which is also the common case
+  // for a trickle that arrives late, after the batch has already gone.
+  if (batch.list.length === 1) {
+    sendSignal(pubkey, { type: "candidate", candidate: batch.list[0] });
+  } else {
+    sendSignal(pubkey, { type: "candidates", candidates: batch.list });
+  }
+}
+
 function publishPresence() {
   sendEphemeral(
     // `sharing` rides along on the beat, so who is sending a picture
@@ -3136,7 +3220,7 @@ function createPeer(pubkey, isInitiator) {
   });
 
   pc.addEventListener("icecandidate", (e) => {
-    if (e.candidate) sendSignal(pubkey, { type: "candidate", candidate: e.candidate.toJSON() });
+    if (e.candidate) queueCandidate(pubkey, e.candidate.toJSON());
   });
 
   pc.addEventListener("connectionstatechange", () => {
@@ -3297,15 +3381,23 @@ async function handleSignal(event) {
     await entry.pc.setRemoteDescription({ type: "answer", sdp: payload.sdp });
     entry.remoteSet = true;
     await flushQueuedCandidates(entry);
-  } else if (payload.type === "candidate") {
-    if (entry.remoteSet) {
-      try {
-        await entry.pc.addIceCandidate(payload.candidate);
-      } catch (err) {
-        console.error("hearth: bad ICE candidate", err);
+  } else if (payload.type === "candidate" || payload.type === "candidates") {
+    // Both shapes, because a tab left open from before batching landed
+    // goes on sending one at a time and its call should still work.
+    const list = payload.type === "candidates"
+      ? (Array.isArray(payload.candidates) ? payload.candidates : [])
+      : [payload.candidate];
+    for (const candidate of list) {
+      if (!candidate) continue;
+      if (entry.remoteSet) {
+        try {
+          await entry.pc.addIceCandidate(candidate);
+        } catch (err) {
+          console.error("hearth: bad ICE candidate", err);
+        }
+      } else {
+        entry.candidateQueue.push(candidate);
       }
-    } else {
-      entry.candidateQueue.push(payload.candidate);
     }
   }
 }
@@ -3313,6 +3405,11 @@ async function handleSignal(event) {
 function teardownPeer(pubkey) {
   const entry = call.peers.get(pubkey);
   if (!entry) return;
+  const batch = candidateBatches.get(pubkey);
+  if (batch) {
+    if (batch.timer !== null) clearTimeout(batch.timer);
+    candidateBatches.delete(pubkey);
+  }
   entry.pc.close();
   if (entry.audioEl) entry.audioEl.remove();
   detachSpeakingDetector(pubkey);
